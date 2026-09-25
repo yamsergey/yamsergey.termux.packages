@@ -1,0 +1,34 @@
+--- a/third_party/wayland-proxy/wayland-proxy.cpp
++++ b/third_party/wayland-proxy/wayland-proxy.cpp
+@@ -1103,8 +1103,14 @@
+   if (mThreadRunning) {
+     Info("thread is still running, terminating.\n");
+     mThreadRunning = false;
++#ifdef __TERMUX__
++    // Bionic has no pthread_cancel. The proxy is disabled on Termux (nsAppRunner.cpp), so this
++    // is not reached; if it is, leave the thread to process exit.
++    pthread_detach(mThread);
++#else
+     pthread_cancel(mThread);
+     pthread_join(mThread, nullptr);
++#endif
+   }
+   if (mProxyServerSocket != -1) {
+     close(mProxyServerSocket);
+--- a/toolkit/xre/nsAppRunner.cpp
++++ b/toolkit/xre/nsAppRunner.cpp
+@@ -5201,7 +5201,14 @@
+ #  ifdef MOZ_WAYLAND
+     if (!display_name) {
+       auto* proxyEnv = getenv("MOZ_DISABLE_WAYLAND_PROXY");
++#ifdef __TERMUX__
++      // The proxy thread cannot be cancelled on bionic, and the compositor it
++      // works around is not ours.
++      (void)proxyEnv;
++      bool disableWaylandProxy = true;
++#else
+       bool disableWaylandProxy = proxyEnv && *proxyEnv;
++#endif
+       if (!disableWaylandProxy && XRE_IsParentProcess() && waylandEnabled) {
+         auto* proxyLog = getenv("WAYLAND_PROXY_LOG");
+         WaylandProxy::SetVerbose(proxyLog && *proxyLog);
