@@ -1,7 +1,7 @@
 name: Firefox (Wayland)
 
 # Builds only x11-packages/firefox for aarch64, with the Wayland toolkit enabled in its
-# mozconfig.cfg. Same steps as packages.yml uses for big packages (host build, no Docker).
+# mozconfig.cfg. Same steps as packages.yml (zram, package-builder Docker image, free-space).
 
 on:
   workflow_dispatch:
@@ -18,31 +18,33 @@ jobs:
   build:
     permissions:
       contents: read
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 360
     steps:
     - name: Clone repository
-      uses: actions/checkout@v5
-    - name: Set up the build environment and free disk space
-      run: |
-        ./scripts/setup-ubuntu.sh
-        unset NDK ANDROID_HOME
-        ./scripts/setup-android-sdk.sh
-        rm -f ${HOME}/lib/ndk-*.zip ${HOME}/lib/sdk-*.zip
-        sudo apt install ninja-build
-        ./scripts/free-space.sh
+      uses: actions/checkout@v7
+    - name: Enable zram
+      uses: ./.github/actions/zram
+      with:
+        algorithm: zstd
+        size: 16G
+        priority: 100
+        device_name: /dev/zram0
+    - name: Load Docker image
+      run: ./scripts/run-docker.sh true
+    - name: Free additional disk space
+      run: ./scripts/free-space.sh
     - name: Build firefox
-      run: |
-        unset NDK ANDROID_HOME
-        ./build-package.sh -I -C -a aarch64 firefox
+      run: ./scripts/run-docker.sh -d ./build-package.sh -I -C -a aarch64 firefox
     - name: Checksums
       if: always()
       run: |
         mkdir -p output
+        test -d termux-packages/output && mv termux-packages/output/* ./output/ || true
         find output -type f -name "*.deb" -exec sha256sum "{}" \; | sort -k2 | tee output/SHA256SUMS
     - name: Store *.deb files
       if: always()
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: firefox-wayland-aarch64-${{ github.sha }}
         path: output/
