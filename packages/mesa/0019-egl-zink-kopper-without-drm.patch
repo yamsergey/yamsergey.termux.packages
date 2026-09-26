@@ -1,0 +1,18 @@
+--- a/src/egl/main/eglapi.c
++++ b/src/egl/main/eglapi.c
+@@ -703,6 +703,15 @@
+                disp->Options.Zink = EGL_TRUE;
+                success = _eglDriver.Initialize(disp);
+             }
++            /* Termux: without a DRM render node (KGSL) the hardware platform path
++             * always fails. zink on the software platform path still renders on
++             * the GPU and presents through kopper (Vulkan WSI) instead of copying
++             * into wl_shm/XPutImage; zink picks its Vulkan device from
++             * LIBGL_ALWAYS_SOFTWARE, not from ForceSoftware. */
++            if (!success && disp->Options.Zink) {
++               disp->Options.ForceSoftware = EGL_TRUE;
++               success = _eglDriver.Initialize(disp);
++            }
+             if (!success) {
+                disp->Options.Zink = EGL_FALSE;
+                disp->Options.ForceSoftware = EGL_TRUE;

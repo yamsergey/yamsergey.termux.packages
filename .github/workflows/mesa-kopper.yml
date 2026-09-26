@@ -1,0 +1,50 @@
+name: Mesa (zink via kopper)
+
+# Builds only packages/mesa for aarch64 with 0019-egl-zink-kopper-without-drm.patch
+# (yamsergey.linux.android E6). Same steps as packages.yml (zram, package-builder Docker image, free-space).
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+    - mesa-kopper
+    paths:
+    - 'packages/mesa/**'
+    - '.github/workflows/mesa-kopper.yml'
+
+permissions: {}
+
+jobs:
+  build:
+    permissions:
+      contents: read
+    runs-on: ubuntu-26.04
+    timeout-minutes: 360
+    steps:
+    - name: Clone repository
+      uses: actions/checkout@v7
+    - name: Enable zram
+      uses: ./.github/actions/zram
+      with:
+        algorithm: zstd
+        size: 16G
+        priority: 100
+        device_name: /dev/zram0
+    - name: Load Docker image
+      run: ./scripts/run-docker.sh true
+    - name: Free additional disk space
+      run: ./scripts/free-space.sh
+    - name: Build mesa
+      run: ./scripts/run-docker.sh -d ./build-package.sh -I -C -a aarch64 mesa
+    - name: Checksums
+      if: always()
+      run: |
+        mkdir -p output
+        test -d termux-packages/output && mv termux-packages/output/* ./output/ || true
+        find output -type f -name "*.deb" -exec sha256sum "{}" \; | sort -k2 | tee output/SHA256SUMS
+    - name: Store *.deb files
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: mesa-kopper-aarch64-${{ github.sha }}
+        path: output/

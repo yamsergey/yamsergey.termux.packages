@@ -4,6 +4,8 @@ TERMUX_PKG_LICENSE="MIT"
 TERMUX_PKG_LICENSE_FILE="docs/license.rst"
 TERMUX_PKG_MAINTAINER="@termux"
 TERMUX_PKG_VERSION="26.2.3"
+# EGL zink via kopper without DRM (0019); the revision tells it apart from the Termux package.
+TERMUX_PKG_REVISION=90
 TERMUX_PKG_SRCURL="https://archive.mesa3d.org/mesa-${TERMUX_PKG_VERSION}.tar.xz"
 TERMUX_PKG_SHA256=1628058a8d2c0615975de5a15ab7bbb9638c50000b5bed9456ff423ea034a81f
 TERMUX_PKG_AUTO_UPDATE=true
