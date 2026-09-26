@@ -1,0 +1,19 @@
+--- a/toolkit/library/moz.build
++++ b/toolkit/library/moz.build
+@@ -183,8 +183,14 @@
+     OS_LIBS += CONFIG["MOZ_GTK3_LIBS"]
+ 
+ if CONFIG["MOZ_WAYLAND"]:
+-    USE_LIBS += [
+-        "mozwayland",
++    # Termux: link the real libraries instead of the mozwayland stubs. The
++    # mozgtk ordering trick above relies on glibc's global symbol scope; on
++    # bionic libxul resolves wl_*, wl_egl_* and xkb_* to the stubs, which
++    # return -1/NULL (Firefox crashed right after wl_display_get_registry).
++    OS_LIBS += [
++        "wayland-client",
++        "wayland-egl",
++        "xkbcommon",
+     ]
+ 
+ if CONFIG["MOZ_WIDGET_TOOLKIT"] == "gtk" or CONFIG["MOZ_TREE_FREETYPE"]:
