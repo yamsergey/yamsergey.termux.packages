@@ -4,7 +4,7 @@ TERMUX_PKG_LICENSE="MPL-2.0"
 TERMUX_PKG_MAINTAINER="@termux"
 TERMUX_PKG_VERSION="156.0.1"
 # Wayland build (mozconfig.cfg); the revision tells it apart from the Termux package.
-TERMUX_PKG_REVISION=90
+TERMUX_PKG_REVISION=91
 TERMUX_PKG_SRCURL="https://archive.mozilla.org/pub/firefox/releases/${TERMUX_PKG_VERSION#*really}/source/firefox-${TERMUX_PKG_VERSION#*really}.source.tar.xz"
 TERMUX_PKG_SHA256=f8b0bf733efebebf9af98ead537598c2cf56c2c1b9c06bf89220ea6731b64724
 # ffmpeg and pulseaudio are dependencies through dlopen(3):
@@ -129,6 +129,8 @@ termux_step_make_install() {
 	./mach install
 
 	install -Dm644 -t "${TERMUX_PREFIX}/share/applications" "${TERMUX_PKG_BUILDER_DIR}/firefox.desktop"
+	# GPU WebRender despite Mesa's software EGL device on Termux (yamsergey.linux.android ADR 013).
+	install -Dm644 -t "${TERMUX_PREFIX}/lib/firefox/defaults/pref" "${TERMUX_PKG_BUILDER_DIR}/termux-gpu.js"
 
 	# Install icons as Arch Linux does
 	local i theme=official
