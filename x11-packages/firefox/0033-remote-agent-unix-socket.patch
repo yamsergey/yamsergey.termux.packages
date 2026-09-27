@@ -1,0 +1,150 @@
+yamsergey.linux.android ADR 020: the Remote Agent (WebDriver BiDi) listens on a Unix socket
+named by the pref remote.unixsocket.path (mode 0600), started in dynamic-start mode (no
+automation marker) once the browser is up; no TCP port. Verified in experiment F0.
+
+--- a/netwerk/test/httpserver/httpd.sys.mjs
++++ b/netwerk/test/httpserver/httpd.sys.mjs
+@@ -390,7 +390,7 @@
+   onSocketAccepted(socket, trans) {
+     dumpn("*** onSocketAccepted(socket=" + socket + ", trans=" + trans + ")");
+ 
+-    dumpn(">>> new connection on " + trans.host + ":" + trans.port);
++    dumpn(">>> new connection on " + (this._unix ? "unix socket" : trans.host + ":" + trans.port));
+ 
+     const SEGMENT_SIZE = 8192;
+     const SEGMENT_COUNT = 1024;
+@@ -412,8 +412,8 @@
+         input,
+         output,
+         this,
+-        socket.port,
+-        trans.port,
++        this._unix ? this._port : socket.port,
++        this._unix ? 0 : trans.port,
+         connectionNumber,
+         trans
+       );
+@@ -449,7 +449,7 @@
+    * @see nsIServerSocketListener.onStopListening
+    */
+   onStopListening(socket) {
+-    dumpn(">>> shutting down server on port " + socket.port);
++    dumpn(">>> shutting down server on port " + (this._unix ? "unix" : socket.port));
+     for (var n in this._connections) {
+       if (!this._connections[n]._requestStarted) {
+         this._connections[n].close();
+@@ -498,6 +498,30 @@
+     this._start(port, "[::1]", true);
+   },
+ 
++  // Termux patch (ADR 020): listen on a Unix socket file (mode 0600) instead of a TCP port.
++  _startUnix(path) {
++    if (this._socket) {
++      throw Components.Exception("", Cr.NS_ERROR_ALREADY_INITIALIZED);
++    }
++    this._doQuit = this._socketClosed = false;
++    this._unix = true;
++    this._host = "localhost";
++    this._port = 80;
++    const file = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
++    file.initWithPath(path);
++    if (file.exists()) {
++      file.remove(false);
++    }
++    const socket = Cc["@mozilla.org/network/server-socket;1"].createInstance(
++      Ci.nsIServerSocket
++    );
++    socket.initWithFilename(file, 0o600, 16);
++    socket.asyncListen(this);
++    this._identity._initialize(80, "localhost", true, false);
++    this._socket = socket;
++    dumpn(">>> listening on unix socket " + path);
++  },
++
+   _start(port, host, dualStack) {
+     if (this._socket) {
+       throw Components.Exception("", Cr.NS_ERROR_ALREADY_INITIALIZED);
+@@ -623,7 +647,7 @@
+             callback.onStopped();
+           };
+ 
+-    dumpn(">>> stopping listening on port " + this._socket.port);
++    dumpn(">>> stopping listening on port " + (this._unix ? "unix" : this._socket.port));
+     this._socket.close();
+     this._socket = null;
+ 
+--- a/remote/components/RemoteAgent.sys.mjs
++++ b/remote/components/RemoteAgent.sys.mjs
+@@ -29,6 +29,8 @@
+   "RemoteAgent:IsBrowserAutomationRunning";
+ 
+ const PREF_DYNAMIC_START_ENABLED = "remote.experimental.dynamicstart.enabled";
++// Termux patch (ADR 020): with a socket path, start in dynamic-start mode on that Unix socket.
++const PREF_UNIX_SOCKET = "remote.unixsocket.path";
+ 
+ const EXIT_CODE_NOT_AVAILABLE = 69;
+ 
+@@ -45,6 +47,7 @@
+   #isBrowserAutomation;
+   #port;
+   #server;
++  #startOnSocket = false;
+ 
+   #webDriverBiDi;
+ 
+@@ -279,6 +282,24 @@
+       return;
+     }
+ 
++    const socketPath = Services.prefs.getStringPref(PREF_UNIX_SOCKET, "");
++    if (socketPath) {
++      try {
++        this.#host = DEFAULT_HOST;
++        this.#server = new lazy.HttpServer();
++        this.#server._startUnix(socketPath);
++        this.#port = 0;
++        this.updateWebdriverActiveFlag(true);
++        Services.obs.notifyObservers(null, "remote-listening", true);
++        await this.#webDriverBiDi?.start();
++        Cu.printStderr(`WebDriver BiDi listening on unix:${socketPath}\n`);
++      } catch (e) {
++        await this.#stop();
++        lazy.logger.error(`Unable to listen on ${socketPath}: ${e.message}`, e);
++      }
++      return;
++    }
++
+     // Try to resolve localhost to an IPv4  and / or IPv6 address so that the
+     // server can be started on a given IP. Only fallback to use localhost if
+     // the hostname cannot be resolved.
+@@ -474,6 +495,17 @@
+ 
+         this.#enabled = this.#handleRemoteDebuggingPortFlag(subject);
+ 
++        if (
++          !this.#enabled &&
++          Services.prefs.getStringPref(PREF_UNIX_SOCKET, "") &&
++          Services.prefs.getBoolPref(PREF_DYNAMIC_START_ENABLED, false)
++        ) {
++          this.#startOnSocket = true;
++          // Both, as the handler removes both.
++          Services.obs.addObserver(this, "browser-idle-startup-tasks-finished");
++          Services.obs.addObserver(this, "mail-idle-startup-tasks-finished");
++        }
++
+         if (this.#enabled) {
+           // Add annotation to crash report to indicate whether the
+           // Remote Agent was active.
+@@ -518,6 +550,12 @@
+         );
+         Services.obs.removeObserver(this, "mail-idle-startup-tasks-finished");
+         this.#browserStartupFinished.resolve();
++        if (this.#startOnSocket) {
++          this.#startOnSocket = false;
++          this.startAtRuntime({ isBrowserAutomation: false }).catch(e =>
++            lazy.logger.error(`Unable to start on the Unix socket: ${e.message}`)
++          );
++        }
+         break;
+ 
+       // Listen for application shutdown to also shutdown the Remote Agent
