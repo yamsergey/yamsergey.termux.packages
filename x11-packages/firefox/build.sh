@@ -63,6 +63,9 @@ termux_step_post_get_source() {
 		termux_setup_rust
 		cargo update -p cc
 	)
+	# The patched cc is a path dependency, so cargo does not cap its lints, and it
+	# denies warnings: Rust 1.99 deprecates Atomic::fetch_update (job_token.rs).
+	sed -i 's/^#!\[deny(warnings)\]/#![allow(warnings)]/' third_party/rust/cc/src/lib.rs
 }
 
 termux_step_pre_configure() {
