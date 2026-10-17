@@ -1,0 +1,69 @@
+--- a/remote/shared/webdriver/Session.sys.mjs
++++ b/remote/shared/webdriver/Session.sys.mjs
+@@ -373,6 +373,14 @@
+     return this.#capabilities;
+   }
+ 
++  /**
++   * Number of WebSocket connections currently attached to this session
++   * (Termux: lets a BiDi-only session end once its last client is gone).
++   */
++  get connectionCount() {
++    return this.#connections.size;
++  }
++
+   get http() {
+     return this.#http;
+   }
+--- a/remote/webdriver-bidi/WebDriverBiDiConnection.sys.mjs
++++ b/remote/webdriver-bidi/WebDriverBiDiConnection.sys.mjs
+@@ -9,6 +9,8 @@
+ ChromeUtils.defineESModuleGetters(lazy, {
+   assert: "chrome://remote/content/shared/webdriver/Assert.sys.mjs",
+   error: "chrome://remote/content/shared/webdriver/Errors.sys.mjs",
++  getWebDriverSessionById:
++    "chrome://remote/content/shared/webdriver/Session.sys.mjs",
+   Log: "chrome://remote/content/shared/Log.sys.mjs",
+   pprint: "chrome://remote/content/shared/Format.sys.mjs",
+   processCapabilities:
+@@ -22,6 +24,12 @@
+   lazy.Log.get(lazy.Log.TYPES.WEBDRIVER_BIDI)
+ );
+ 
++// Termux: end a BiDi-only session when its last WebSocket connection closes.
++// Firefox allows a single WebDriver session and only ends it on an explicit
++// "session.end"; a client that just drops the socket (crash, killed app)
++// would otherwise lock the remote agent until the browser restarts.
++const PREF_END_SESSION_ON_DISCONNECT = "remote.bidi.end-session-on-disconnect";
++
+ export class WebDriverBiDiConnection extends WebSocketConnection {
+   #sessionConfigFlags;
+ 
+@@ -160,8 +168,27 @@
+    * Called by the `transport` when the connection is closed.
+    */
+   onConnectionClose() {
++    const session = this.session;
+     this.unregisterSession();
+ 
++    if (
++      session?.bidi &&
++      !session.http &&
++      session.connectionCount === 0 &&
++      // Not already being destroyed (destroy() closes its connections).
++      lazy.getWebDriverSessionById(session.id) === session &&
++      Services.prefs.getBoolPref(PREF_END_SESSION_ON_DISCONNECT, true)
++    ) {
++      lazy.logger.debug(
++        `Ending BiDi session ${session.id} after its last connection closed`
++      );
++      try {
++        this.endSession();
++      } catch (e) {
++        lazy.logger.warn(`Failed to end orphaned BiDi session: ${e}`);
++      }
++    }
++
+     super.onConnectionClose();
+   }
+ 
