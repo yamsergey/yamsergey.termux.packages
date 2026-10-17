@@ -87,27 +87,38 @@
    const TrackBuffer& GetTrackBuffer(TrackInfo::TrackType aTrack) const;
    const media::TimeIntervals& Buffered(TrackInfo::TrackType) const;
    const media::TimeUnit& HighestStartTime(TrackInfo::TrackType) const;
-@@ -252,6 +271,35 @@
+@@ -252,6 +271,46 @@
    void AppendDataToCurrentInputBuffer(const MediaSpan& aData)
        MOZ_REQUIRES(mTaskQueueCapability);
  
 +  // Termux patch 0034: media dump, task queue only. These touch no member
 +  // guarded by mTaskQueueCapability, so they carry no annotation.
++  //
++  // One part per distinct init segment: a repeated init segment (seek, abort,
++  // discontinuity) keeps appending to the part it started, a rendition seen
++  // before reopens its part. Media data is held back until the parser says
++  // the segment is complete, so a part never contains a truncated fragment.
 +  void DoSetDump(bool aEnabled, const nsCString& aDir,
 +                 const nsCString& aBaseName, const nsCString& aExt);
-+  // The next write opens a new part.
-+  void DumpRotate() { mDumpNeedsRotate = true; }
-+  // A complete init segment: starts a new part.
++  // A complete init segment arrived (also used to start mid-stream).
 +  void DumpWriteInit(MediaByteBuffer* aInit);
-+  // Media segment bytes; dropped until the first segment boundary after
-+  // the dump was enabled.
++  // Media segment bytes, kept pending until DumpFlushSegment().
 +  void DumpWriteMedia(const MediaSpan& aData);
++  // The current media segment is complete: write what is pending.
++  void DumpFlushSegment();
++  // The current media segment was cut short: forget what is pending.
++  void DumpDropPending() { mDumpPending.ClearAndRetainStorage(); }
 +  void DumpWriteBytes(const uint8_t* aData, size_t aLength);
 +  void DumpNoteSegment(const media::TimeUnit& aStart,
 +                       const media::TimeUnit& aEnd);
 +  void DumpClose();
 +  FILE* mDumpFile = nullptr;
-+  bool mDumpNeedsRotate = false;
++  // The parts written so far: the init segment each one started with and its
++  // path (parallel arrays); mDumpCurrentPart indexes the open one, -1 = none.
++  nsTArray<RefPtr<MediaByteBuffer>> mDumpPartInits;
++  nsTArray<nsCString> mDumpPartPaths;
++  int32_t mDumpCurrentPart = -1;
++  nsTArray<uint8_t> mDumpPending;
 +  bool mDumpAwaitSegment = false;
 +  nsCString mDumpDir;
 +  nsCString mDumpBaseName;
@@ -134,7 +145,7 @@
  
  extern mozilla::LogModule* GetMediaSourceLog();
  
-@@ -105,7 +107,144 @@
+@@ -105,7 +107,184 @@
    DDLINKCHILD("parser", mParser.get());
  }
  
@@ -180,9 +191,12 @@
 +                                    const nsCString& aExt) {
 +  if (!aEnabled) {
 +    DumpClose();
++    DumpDropPending();
++    mDumpPartInits.Clear();
++    mDumpPartPaths.Clear();
++    mDumpCurrentPart = -1;
 +    mDumpEnabled = false;
 +    mDumpAwaitSegment = false;
-+    mDumpNeedsRotate = false;
 +    MSE_DEBUG("Dump off ({} bytes, {} parts)", uint64_t(mDumpBytes),
 +              uint32_t(mDumpParts));
 +    return;
@@ -198,9 +212,12 @@
 +  mDumpStartUs = -1;
 +  mDumpEndUs = -1;
 +  mDumpError = false;
++  mDumpPartInits.Clear();
++  mDumpPartPaths.Clear();
++  mDumpCurrentPart = -1;
++  DumpDropPending();
 +  // The current init segment is written, and media data copied, from the
 +  // next segment boundary on (SegmentParserLoop).
-+  mDumpNeedsRotate = true;
 +  mDumpAwaitSegment = true;
 +  mDumpEnabled = true;
 +  MSE_DEBUG("Dump on: {}/{}-pNNN.{}", mDumpDir.get(), mDumpBaseName.get(),
@@ -211,8 +228,50 @@
 +  if (!mDumpEnabled || !aInit || aInit->IsEmpty()) {
 +    return;
 +  }
-+  mDumpNeedsRotate = true;
 +  mDumpAwaitSegment = false;
++  // An init segment only arrives at a segment boundary; whatever was pending
++  // was cut short (abort, discontinuity) and would corrupt the part.
++  DumpDropPending();
++
++  // Same init segment as the open part: keep appending to it.
++  if (mDumpCurrentPart >= 0 && mDumpFile &&
++      *mDumpPartInits[mDumpCurrentPart] == *aInit) {
++    return;
++  }
++  // A rendition seen before: continue its part.
++  for (size_t i = 0; i < mDumpPartInits.Length(); i++) {
++    if (*mDumpPartInits[i] == *aInit) {
++      DumpClose();
++      mDumpFile = fopen(mDumpPartPaths[i].get(), "ab");
++      if (!mDumpFile) {
++        MSE_DEBUG("Dump: cannot reopen {}", mDumpPartPaths[i].get());
++        mDumpError = true;
++        mDumpEnabled = false;
++        return;
++      }
++      mDumpCurrentPart = int32_t(i);
++      MSE_DEBUG("Dump: back to part {}", i + 1);
++      return;
++    }
++  }
++  // A new rendition: a new part, starting with its init segment.
++  DumpClose();
++  uint32_t part = ++mDumpParts;
++  nsPrintfCString path("%s/%s-p%03u.%s", mDumpDir.get(), mDumpBaseName.get(),
++                       part, mDumpExt.get());
++  mDumpFile = fopen(path.get(), "wb");
++  if (!mDumpFile) {
++    MSE_DEBUG("Dump: cannot open {}", path.get());
++    mDumpError = true;
++    mDumpEnabled = false;
++    return;
++  }
++  RefPtr<MediaByteBuffer> init = new MediaByteBuffer();
++  (void)init->AppendElements(aInit->Elements(), aInit->Length());
++  mDumpPartInits.AppendElement(init);
++  mDumpPartPaths.AppendElement(nsCString(path));
++  mDumpCurrentPart = int32_t(mDumpPartInits.Length()) - 1;
++  MSE_DEBUG("Dump: part {} -> {}", part, path.get());
 +  DumpWriteBytes(aInit->Elements(), aInit->Length());
 +}
 +
@@ -220,30 +279,22 @@
 +  if (!mDumpEnabled || mDumpAwaitSegment) {
 +    return;
 +  }
-+  DumpWriteBytes(aData.Elements(), aData.Length());
++  (void)mDumpPending.AppendElements(aData.Elements(), aData.Length());
++}
++
++void TrackBuffersManager::DumpFlushSegment() {
++  if (!mDumpEnabled || mDumpPending.IsEmpty()) {
++    return;
++  }
++  if (mDumpFile) {
++    DumpWriteBytes(mDumpPending.Elements(), mDumpPending.Length());
++  }
++  DumpDropPending();
 +}
 +
 +void TrackBuffersManager::DumpWriteBytes(const uint8_t* aData,
 +                                         size_t aLength) {
-+  if (!aLength) {
-+    return;
-+  }
-+  if (mDumpNeedsRotate) {
-+    DumpClose();
-+    mDumpNeedsRotate = false;
-+    uint32_t part = ++mDumpParts;
-+    nsPrintfCString path("%s/%s-p%03u.%s", mDumpDir.get(),
-+                         mDumpBaseName.get(), part, mDumpExt.get());
-+    mDumpFile = fopen(path.get(), "wb");
-+    if (!mDumpFile) {
-+      MSE_DEBUG("Dump: cannot open {}", path.get());
-+      mDumpError = true;
-+      mDumpEnabled = false;
-+      return;
-+    }
-+    MSE_DEBUG("Dump: part {} -> {}", part, path.get());
-+  }
-+  if (!mDumpFile) {
++  if (!aLength || !mDumpFile) {
 +    return;
 +  }
 +  size_t written = fwrite(aData, 1, aLength, mDumpFile);
@@ -280,23 +331,24 @@
  
  RefPtr<TrackBuffersManager::AppendPromise> TrackBuffersManager::AppendData(
      already_AddRefed<MediaByteBuffer> aData,
-@@ -249,6 +388,7 @@
+@@ -249,6 +428,8 @@
        break;
      case Type::Detach:
        mCurrentInputBuffer = nullptr;
++      DumpDropPending();
 +      DumpClose();
        MOZ_DIAGNOSTIC_ASSERT(mQueue.Length() == 0,
                              "Detach task must be the last");
        mVideoTracks.Reset();
-@@ -511,6 +651,7 @@
+@@ -511,6 +692,7 @@
      // The demuxer will be recreated during the next run of SegmentParserLoop.
      // As such we don't need to notify it that data has been removed.
      mCurrentInputBuffer = new SourceBufferResource();
-+    DumpRotate();
++    DumpDropPending();  // Termux patch 0034: the segment was cut short
    }
  
    // We could be left with a demuxer in an unusable state. It needs to be
-@@ -967,6 +1108,11 @@
+@@ -967,6 +1149,11 @@
        if (NS_SUCCEEDED(haveMediaSegment)) {
          SetAppendState(AppendState::PARSING_MEDIA_SEGMENT);
          mNewMediaSegmentStarted = true;
@@ -308,7 +360,7 @@
          continue;
        }
        // We have neither an init segment nor a media segment.
-@@ -1004,6 +1150,11 @@
+@@ -1004,6 +1191,11 @@
          RejectAppend(newData, __func__);
          return;
        }
@@ -320,7 +372,7 @@
        mProcessedInput += mInputBuffer->Length();
      }
  
-@@ -1205,6 +1356,7 @@
+@@ -1205,6 +1397,7 @@
    // that data has been appended yet ; so we simply append the init segment
    // to the resource.
    mCurrentInputBuffer->AppendData(mParser->InitData());
@@ -328,7 +380,7 @@
    CreateDemuxerforMIMEType();
    if (!mInputDemuxer) {
      RejectAppend(NS_ERROR_FAILURE, __func__);
-@@ -1274,6 +1426,7 @@
+@@ -1274,6 +1467,7 @@
      const MediaSpan& aData) {
    MOZ_ASSERT(mCurrentInputBuffer);
    mCurrentInputBuffer->AppendData(aData);
@@ -336,7 +388,7 @@
    mInputDemuxer->NotifyDataArrived();
  }
  
-@@ -1301,6 +1454,7 @@
+@@ -1301,6 +1495,7 @@
    // that data has been appended yet ; so we simply append the init segment
    // to the resource.
    mCurrentInputBuffer->AppendData(mParser->InitData());
@@ -344,6 +396,22 @@
    uint32_t length = endInit - (mProcessedInput - mInputBuffer->Length());
    MOZ_RELEASE_ASSERT(length <= mInputBuffer->Length());
    mInputBuffer->RemoveFront(length);
+@@ -1703,6 +1898,7 @@
+       // We've completed our earlier media segment and no new data is to be
+       // processed. This happens with some containers that can't detect that a
+       // media segment is ending until a new one starts.
++      DumpFlushSegment();  // Termux patch 0034
+       RefPtr<CodedFrameProcessingPromise> p =
+           mProcessingPromise.Ensure(__func__);
+       CompleteCodedFrameProcessing();
+@@ -1710,6 +1906,7 @@
+     }
+     AppendDataToCurrentInputBuffer(mInputBuffer->To(length));
+     mInputBuffer->RemoveFront(length);
++    DumpFlushSegment();  // Termux patch 0034: the segment is complete
+   }
+ 
+   RefPtr<CodedFrameProcessingPromise> p = mProcessingPromise.Ensure(__func__);
 --- a/dom/media/mediasource/SourceBuffer.h
 +++ b/dom/media/mediasource/SourceBuffer.h
 @@ -13,6 +13,7 @@
