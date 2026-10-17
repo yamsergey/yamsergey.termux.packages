@@ -1,0 +1,490 @@
+--- /dev/null
++++ b/browser/components/termux/moz.build
+@@ -0,0 +1,11 @@
++# -*- Mode: python; indent-tabs-mode: nil; tab-width: 40 -*-
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++# Termux media recording toolbar button (yamsergey.termux.packages patch 0037).
++
++MOZ_SRC_FILES += [
++    "TermuxRecordingUI.sys.mjs",
++]
+--- /dev/null
++++ b/browser/components/termux/TermuxRecordingUI.sys.mjs
+@@ -0,0 +1,438 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++/**
++ * Termux media recording toolbar button (yamsergey.termux.packages patch
++ * 0037). One CustomizableUI button in the nav-bar, shown only while the
++ * selected tab has a streamed (MSE) video, red while recording; its popover
++ * starts, pauses and stops the recording kept by TermuxMediaRecording.
++ */
++
++const lazy = {};
++
++ChromeUtils.defineESModuleGetters(lazy, {
++  CustomizableUI:
++    "moz-src:///browser/components/customizableui/CustomizableUI.sys.mjs",
++  TermuxMediaRecording:
++    "moz-src:///toolkit/components/termux/TermuxMediaRecording.sys.mjs",
++});
++
++const WIDGET_ID = "termux-record-button";
++const PANEL_ID = "termux-record-panel";
++const HTML_NS = "http://www.w3.org/1999/xhtml";
++
++function svgIcon(body) {
++  return (
++    "data:image/svg+xml," +
++    encodeURIComponent(
++      `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">${body}</svg>`
++    )
++  );
++}
++
++const ICON_IDLE = svgIcon(
++  '<path fill="context-fill" fill-opacity="context-fill-opacity" d="M8 1a7 7 0 1 1 0 14A7 7 0 0 1 8 1zm0 1.5a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11z"/>' +
++    '<circle fill="context-fill" fill-opacity="context-fill-opacity" cx="8" cy="8" r="2.5"/>'
++);
++const ICON_REC = svgIcon(
++  '<path fill="#e22850" d="M8 1a7 7 0 1 1 0 14A7 7 0 0 1 8 1zm0 1.5a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11z"/>' +
++    '<circle fill="#e22850" cx="8" cy="8" r="3.5"/>'
++);
++const ICON_PAUSED = svgIcon(
++  '<path fill="context-fill" fill-opacity="context-fill-opacity" d="M8 1a7 7 0 1 1 0 14A7 7 0 0 1 8 1zm0 1.5a5.5 5.5 0 1 0 0 11 5.5 5.5 0 0 0 0-11z"/>' +
++    '<rect fill="context-fill" fill-opacity="context-fill-opacity" x="5.5" y="5" width="2" height="6"/>' +
++    '<rect fill="context-fill" fill-opacity="context-fill-opacity" x="8.5" y="5" width="2" height="6"/>'
++);
++
++function formatTime(ms) {
++  const total = Math.max(0, Math.round(ms / 1000));
++  const h = Math.floor(total / 3600);
++  const m = Math.floor((total % 3600) / 60);
++  const s = total % 60;
++  const mm = String(m).padStart(2, "0");
++  const ss = String(s).padStart(2, "0");
++  return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
++}
++
++function formatBytes(bytes) {
++  if (bytes >= 1024 * 1024 * 1024) {
++    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
++  }
++  if (bytes >= 1024 * 1024) {
++    return `${Math.round(bytes / (1024 * 1024))} MB`;
++  }
++  return `${Math.round(bytes / 1024)} KB`;
++}
++
++function describeTrack(track) {
++  if (track.kind === "video") {
++    const size =
++      track.width && track.height ? `${track.width}×${track.height}` : "";
++    return ["Video", size, track.codec || track.mime].filter(Boolean).join(" · ");
++  }
++  const audio = [];
++  if (track.channels) {
++    audio.push(`${track.channels} ch`);
++  }
++  if (track.rate) {
++    audio.push(`${Math.round(track.rate / 1000)} kHz`);
++  }
++  return ["Audio", audio.join(", "), track.codec || track.mime]
++    .filter(Boolean)
++    .join(" · ");
++}
++
++export const TermuxRecordingUI = {
++  _inited: false,
++  _windows: new Set(),
++  _entries: new WeakMap(),
++
++  init() {
++    if (this._inited) {
++      return;
++    }
++    this._inited = true;
++
++    lazy.CustomizableUI.createWidget({
++      id: WIDGET_ID,
++      type: "button",
++      defaultArea: lazy.CustomizableUI.AREA_NAVBAR,
++      localized: false,
++      label: "Record media",
++      tooltiptext: "Record media on this page",
++      overflows: false,
++      removable: true,
++      onCreated: node => this._onWidgetCreated(node),
++      onCommand: event => this._onCommand(event),
++    });
++
++    this._onState = () => this._updateAll();
++    lazy.TermuxMediaRecording.on("stream-detected", this._onState);
++    lazy.TermuxMediaRecording.on("state-changed", this._onState);
++  },
++
++  _onWidgetCreated(node) {
++    const win = node.ownerGlobal;
++    node.setAttribute("image", ICON_IDLE);
++    node.hidden = true;
++    this._entries.set(win, { node, panel: null });
++    this._windows.add(win);
++    win.addEventListener(
++      "unload",
++      () => {
++        this._windows.delete(win);
++      },
++      { once: true }
++    );
++
++    const attach = () => {
++      win.gBrowser?.tabContainer.addEventListener("TabSelect", () =>
++        this._updateWindow(win)
++      );
++      this._updateWindow(win);
++    };
++    if (win.gBrowserInit?.delayedStartupFinished) {
++      attach();
++    } else {
++      const observer = subject => {
++        if (subject === win) {
++          Services.obs.removeObserver(
++            observer,
++            "browser-delayed-startup-finished"
++          );
++          attach();
++        }
++      };
++      Services.obs.addObserver(observer, "browser-delayed-startup-finished");
++    }
++  },
++
++  _onCommand(event) {
++    const node = event.target;
++    const win = node.ownerGlobal;
++    const entry = this._entries.get(win);
++    if (!entry) {
++      return;
++    }
++    const panel = this._ensurePanel(win, entry);
++    if (panel.state === "open" || panel.state === "showing") {
++      panel.hidePopup();
++      return;
++    }
++    this._render(win, entry);
++    panel.openPopup(node, "bottomright topright", 0, 0, false, false);
++  },
++
++  _updateAll() {
++    for (const win of this._windows) {
++      this._updateWindow(win);
++    }
++  },
++
++  _currentState(win) {
++    const browsingContext = win.gBrowser?.selectedBrowser?.browsingContext;
++    return browsingContext
++      ? lazy.TermuxMediaRecording.getState(browsingContext)
++      : null;
++  },
++
++  _updateWindow(win) {
++    const entry = this._entries.get(win);
++    if (!entry || win.closed) {
++      return;
++    }
++    const state = this._currentState(win);
++    const show =
++      !!state &&
++      (state.tracks.length > 0 ||
++        state.status === "recording" ||
++        state.status === "paused");
++    entry.node.hidden = !show;
++    let icon = ICON_IDLE;
++    let tooltip = "Record media on this page";
++    if (state?.status === "recording") {
++      icon = ICON_REC;
++      tooltip = `Recording · ${formatTime(state.capturedMs)} · ${formatBytes(state.bytes)}`;
++    } else if (state?.status === "paused") {
++      icon = ICON_PAUSED;
++      tooltip = "Recording paused";
++    }
++    entry.node.setAttribute("image", icon);
++    entry.node.setAttribute("tooltiptext", tooltip);
++    if (entry.panel && entry.panel.state === "open") {
++      this._render(win, entry);
++    }
++  },
++
++  _ensurePanel(win, entry) {
++    const doc = win.document;
++    let panel = doc.getElementById(PANEL_ID);
++    if (!panel) {
++      panel = doc.createXULElement("panel");
++      panel.id = PANEL_ID;
++      panel.setAttribute("type", "arrow");
++      panel.setAttribute("orient", "vertical");
++      panel.setAttribute("noautofocus", "true");
++      const content = doc.createElementNS(HTML_NS, "div");
++      content.id = `${PANEL_ID}-content`;
++      content.style.cssText =
++        "width: 340px; padding: 14px; display: flex; flex-direction: column; gap: 12px; font: message-box; font-size: 13px;";
++      panel.appendChild(content);
++      doc.getElementById("mainPopupSet").appendChild(panel);
++    }
++    entry.panel = panel;
++    return panel;
++  },
++
++  _el(doc, tag, style, text) {
++    const el = doc.createElementNS(HTML_NS, tag);
++    if (style) {
++      el.style.cssText = style;
++    }
++    if (text !== undefined) {
++      el.textContent = text;
++    }
++    return el;
++  },
++
++  _button(doc, label, primary, onClick) {
++    const button = this._el(
++      doc,
++      "button",
++      `min-height: 32px; padding: 0 14px; border-radius: 6px; font: inherit; font-weight: 600; cursor: pointer;` +
++        (primary
++          ? "border: none; background: #0060df; color: #fff;"
++          : "border: 1px solid color-mix(in srgb, currentColor 30%, transparent); background: transparent; color: inherit;"),
++      label
++    );
++    button.addEventListener("click", onClick);
++    return button;
++  },
++
++  _render(win, entry) {
++    const doc = win.document;
++    const panel = this._ensurePanel(win, entry);
++    const content = panel.firstElementChild;
++    const browsingContext = win.gBrowser?.selectedBrowser?.browsingContext;
++    const state = this._currentState(win);
++    content.replaceChildren();
++    if (!browsingContext) {
++      return;
++    }
++
++    const status = state?.status || "idle";
++    const muted = "opacity: 0.7; font-size: 12px;";
++    const row = (gap = 10) =>
++      this._el(doc, "div", `display: flex; align-items: center; gap: ${gap}px;`);
++
++    // Header
++    let title = "Record media on this page";
++    let subtitle = "Saves the video as it streams, then merges it into one file.";
++    if (state?.encrypted && status !== "recording" && status !== "paused") {
++      title = "This video can't be recorded";
++      subtitle =
++        "The stream is protected with DRM. Firefox only receives encrypted data for it, so a recording would not play.";
++    } else if (status === "recording") {
++      title = "Recording";
++      subtitle = state.origin || "";
++    } else if (status === "paused") {
++      title = "Recording paused";
++      subtitle = state.origin || "";
++    } else if (status === "stopped") {
++      title = "Recording saved";
++      subtitle = `${state.files.length} file${state.files.length === 1 ? "" : "s"} in ${state.dir}`;
++    } else if (status === "error") {
++      title = "Recording failed";
++      subtitle = state.error || "Unknown error";
++    }
++    const header = this._el(
++      doc,
++      "div",
++      "display: flex; flex-direction: column; gap: 4px;"
++    );
++    header.appendChild(
++      this._el(doc, "h2", "margin: 0; font-size: 15px; font-weight: 600;", title)
++    );
++    header.appendChild(this._el(doc, "span", muted, subtitle));
++    content.appendChild(header);
++
++    // Live stats
++    if (state && (status === "recording" || status === "paused")) {
++      const grid = this._el(
++        doc,
++        "div",
++        "display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px;"
++      );
++      for (const [label, value] of [
++        ["Captured", formatTime(state.capturedMs)],
++        ["Size", formatBytes(state.bytes)],
++        ["Parts", String(state.parts)],
++      ]) {
++        const cell = this._el(
++          doc,
++          "div",
++          "display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border-radius: 6px; background: color-mix(in srgb, currentColor 8%, transparent);"
++        );
++        cell.appendChild(
++          this._el(doc, "span", "font-size: 11px; opacity: 0.7; text-transform: uppercase;", label)
++        );
++        cell.appendChild(
++          this._el(doc, "span", "font-size: 17px; font-weight: 600; font-variant-numeric: tabular-nums;", value)
++        );
++        grid.appendChild(cell);
++      }
++      content.appendChild(grid);
++    }
++
++    // Tracks
++    if (state?.tracks.length) {
++      const list = this._el(
++        doc,
++        "div",
++        "display: flex; flex-direction: column; gap: 6px;"
++      );
++      for (const track of state.tracks) {
++        const line = row();
++        line.style.cssText +=
++          "padding: 8px 10px; border-radius: 6px; background: color-mix(in srgb, currentColor 8%, transparent);";
++        const text = this._el(doc, "div", "display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0;");
++        text.appendChild(
++          this._el(doc, "span", "font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;", describeTrack(track))
++        );
++        const details = [];
++        if (track.encrypted) {
++          details.push("Encrypted");
++        }
++        if (track.parts) {
++          details.push(`${track.parts} part${track.parts === 1 ? "" : "s"}`);
++        }
++        if (track.bytes) {
++          details.push(formatBytes(track.bytes));
++        }
++        text.appendChild(this._el(doc, "span", muted, details.join(" · ") || " "));
++        line.appendChild(text);
++        list.appendChild(line);
++      }
++      content.appendChild(list);
++    }
++
++    // Error line
++    if (state?.error && status !== "error") {
++      content.appendChild(
++        this._el(doc, "span", "font-size: 12px; color: #e22850;", state.error)
++      );
++    }
++
++    // Options and footer for the idle / stopped states
++    let fromStart = null;
++    if (!state?.encrypted && (status === "idle" || status === "stopped")) {
++      const option = row();
++      option.style.alignItems = "flex-start";
++      fromStart = this._el(doc, "input", "margin: 2px 0 0; width: 16px; height: 16px;");
++      fromStart.type = "checkbox";
++      fromStart.id = `${PANEL_ID}-from-start`;
++      fromStart.checked = true;
++      const label = this._el(doc, "label", "display: flex; flex-direction: column; gap: 2px; cursor: pointer;");
++      label.htmlFor = fromStart.id;
++      label.appendChild(this._el(doc, "span", "", "Start from the beginning"));
++      label.appendChild(
++        this._el(doc, "span", muted, "Rewinds the video so the whole thing is captured, not just from here.")
++      );
++      option.appendChild(fromStart);
++      option.appendChild(label);
++      content.appendChild(option);
++
++      const dir = Services.prefs.getStringPref("media.termux.recording.dir", "");
++      content.appendChild(
++        this._el(doc, "span", muted, dir ? `Saves to ${dir}` : "media.termux.recording.dir is not set")
++      );
++    }
++
++    if (status === "recording" || status === "paused") {
++      content.appendChild(
++        this._el(doc, "span", muted, "Keeps recording while you browse other tabs. Closing this tab stops and saves what was captured.")
++      );
++    }
++
++    // Buttons
++    const buttons = this._el(
++      doc,
++      "div",
++      "display: flex; gap: 8px; justify-content: flex-end; padding-top: 2px;"
++    );
++    const close = () => panel.hidePopup();
++    const recorder = lazy.TermuxMediaRecording;
++    if (state?.encrypted && status !== "recording" && status !== "paused") {
++      buttons.appendChild(this._button(doc, "Close", true, close));
++    } else if (status === "recording") {
++      buttons.appendChild(
++        this._button(doc, "Pause", false, () => recorder.pause(browsingContext))
++      );
++      buttons.appendChild(
++        this._button(doc, "Stop and save", true, () => {
++          recorder.stop(browsingContext).catch(console.error);
++        })
++      );
++    } else if (status === "paused") {
++      buttons.appendChild(
++        this._button(doc, "Stop and save", false, () => {
++          recorder.stop(browsingContext).catch(console.error);
++        })
++      );
++      buttons.appendChild(
++        this._button(doc, "Resume", true, () => recorder.resume(browsingContext))
++      );
++    } else {
++      buttons.appendChild(this._button(doc, "Cancel", false, close));
++      buttons.appendChild(
++        this._button(doc, "Start recording", true, () => {
++          recorder
++            .start(browsingContext, { fromBeginning: !!fromStart?.checked })
++            .catch(console.error);
++        })
++      );
++    }
++    content.appendChild(buttons);
++  },
++};
+--- a/browser/components/moz.build
++++ b/browser/components/moz.build
+@@ -75,6 +75,7 @@
+     "tabnotes",
+     "tabunloader",
+     "taskbartabs",
++    "termux",
+     "textrecognition",
+     "topsites",
+     "translations",
+--- a/browser/components/BrowserGlue.sys.mjs
++++ b/browser/components/BrowserGlue.sys.mjs
+@@ -77,6 +77,8 @@
+   TelemetryReportingPolicy:
+     "resource://gre/modules/TelemetryReportingPolicy.sys.mjs",
+   TRRRacer: "resource:///modules/TRRPerformance.sys.mjs",
++  TermuxRecordingUI:
++    "moz-src:///browser/components/termux/TermuxRecordingUI.sys.mjs",
+   WebChannel: "resource://gre/modules/WebChannel.sys.mjs",
+   WebProtocolHandlerRegistrar:
+     "resource:///modules/WebProtocolHandlerRegistrar.sys.mjs",
+@@ -778,6 +780,13 @@
+ 
+   // the first browser window has finished initializing
+   _onFirstWindowLoaded: function BG__onFirstWindowLoaded(aWindow) {
++    // Termux media recording toolbar button (patch 0037).
++    try {
++      lazy.TermuxRecordingUI.init();
++    } catch (e) {
++      console.error("TermuxRecordingUI failed to initialize", e);
++    }
++
+     // A channel for "remote troubleshooting" code...
+     let channel = new lazy.WebChannel(
+       "remote-troubleshooting",

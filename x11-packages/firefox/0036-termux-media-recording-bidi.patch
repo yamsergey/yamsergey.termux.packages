@@ -1,0 +1,234 @@
+--- /dev/null
++++ b/remote/webdriver-bidi/modules/root/termux.sys.mjs
+@@ -0,0 +1,210 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++import { RootBiDiModule } from "chrome://remote/content/webdriver-bidi/modules/RootBiDiModule.sys.mjs";
++
++const lazy = {};
++
++ChromeUtils.defineESModuleGetters(lazy, {
++  assert: "chrome://remote/content/shared/webdriver/Assert.sys.mjs",
++  NavigableManager: "chrome://remote/content/shared/NavigableManager.sys.mjs",
++  pprint: "chrome://remote/content/shared/Format.sys.mjs",
++  TermuxMediaRecording:
++    "moz-src:///toolkit/components/termux/TermuxMediaRecording.sys.mjs",
++});
++
++const ACTIONS = ["start", "pause", "resume", "stop"];
++
++/**
++ * Termux media recording (yamsergey.termux.packages patch 0036).
++ *
++ * Commands
++ *   termux.setMediaRecording      {context, action, fromBeginning?} -> state
++ *   termux.getMediaRecordingState {context}                         -> state
++ *   termux.listRecordings         {}                                -> {recordings}
++ *
++ * Events
++ *   termux.mediaStreamDetected         a tab gained its first MSE track
++ *   termux.mediaRecordingStateChanged  any later change
++ *
++ * `state` is TermuxMediaRecording's state with `context` (the navigable id)
++ * in place of the browsing context.
++ */
++class TermuxModule extends RootBiDiModule {
++  #subscribedEvents;
++
++  constructor(messageHandler) {
++    super(messageHandler);
++    this.#subscribedEvents = new Set();
++  }
++
++  destroy() {
++    for (const event of [...this.#subscribedEvents]) {
++      this.#unsubscribeEvent(event);
++    }
++  }
++
++  async setMediaRecording(options = {}) {
++    const { context: contextId, action, fromBeginning = false } = options;
++
++    lazy.assert.string(
++      contextId,
++      lazy.pprint`Expected "context" to be a string, got ${contextId}`
++    );
++    lazy.assert.string(
++      action,
++      lazy.pprint`Expected "action" to be a string, got ${action}`
++    );
++    lazy.assert.that(
++      value => ACTIONS.includes(value),
++      lazy.pprint`Expected "action" to be one of ${ACTIONS}, got ${action}`
++    )(action);
++    lazy.assert.boolean(
++      fromBeginning,
++      lazy.pprint`Expected "fromBeginning" to be a boolean, got ${fromBeginning}`
++    );
++
++    const context = this._getNavigable(contextId);
++    const top = context.top;
++
++    switch (action) {
++      case "start":
++        await lazy.TermuxMediaRecording.start(top, { fromBeginning });
++        break;
++      case "pause":
++        lazy.TermuxMediaRecording.pause(top);
++        break;
++      case "resume":
++        lazy.TermuxMediaRecording.resume(top);
++        break;
++      case "stop":
++        await lazy.TermuxMediaRecording.stop(top);
++        break;
++    }
++
++    return this.#serialize(lazy.TermuxMediaRecording.getState(top));
++  }
++
++  getMediaRecordingState(options = {}) {
++    const { context: contextId } = options;
++
++    lazy.assert.string(
++      contextId,
++      lazy.pprint`Expected "context" to be a string, got ${contextId}`
++    );
++
++    const context = this._getNavigable(contextId);
++    return this.#serialize(lazy.TermuxMediaRecording.getState(context.top));
++  }
++
++  listRecordings() {
++    return {
++      recordings: lazy.TermuxMediaRecording.listRecordings().map(state =>
++        this.#serialize(state)
++      ),
++    };
++  }
++
++  #serialize(state) {
++    if (!state) {
++      return null;
++    }
++    const { browsingContext, ...rest } = state;
++    let context = null;
++    try {
++      if (browsingContext && !browsingContext.isDiscarded) {
++        context =
++          lazy.NavigableManager.getIdForBrowsingContext(browsingContext);
++      }
++    } catch (e) {
++      // The tab is gone; the summary is still useful.
++    }
++    return { context, ...rest };
++  }
++
++  #emit(eventName, state) {
++    const browsingContext = state?.browsingContext;
++    if (!browsingContext || browsingContext.isDiscarded) {
++      return;
++    }
++    this._emitEventForBrowsingContext(
++      browsingContext.id,
++      eventName,
++      this.#serialize(state)
++    );
++  }
++
++  #onStreamDetected = state => {
++    this.#emit("termux.mediaStreamDetected", state);
++  };
++
++  #onStateChanged = state => {
++    this.#emit("termux.mediaRecordingStateChanged", state);
++  };
++
++  #subscribeEvent(event) {
++    if (this.#subscribedEvents.has(event)) {
++      return;
++    }
++    switch (event) {
++      case "termux.mediaStreamDetected":
++        lazy.TermuxMediaRecording.on("stream-detected", this.#onStreamDetected);
++        break;
++      case "termux.mediaRecordingStateChanged":
++        lazy.TermuxMediaRecording.on("state-changed", this.#onStateChanged);
++        break;
++      default:
++        return;
++    }
++    this.#subscribedEvents.add(event);
++  }
++
++  #unsubscribeEvent(event) {
++    if (!this.#subscribedEvents.has(event)) {
++      return;
++    }
++    switch (event) {
++      case "termux.mediaStreamDetected":
++        lazy.TermuxMediaRecording.off(
++          "stream-detected",
++          this.#onStreamDetected
++        );
++        break;
++      case "termux.mediaRecordingStateChanged":
++        lazy.TermuxMediaRecording.off("state-changed", this.#onStateChanged);
++        break;
++    }
++    this.#subscribedEvents.delete(event);
++  }
++
++  /**
++   * Internal commands
++   */
++
++  _applySessionData(params) {
++    const { category } = params;
++    if (category === "event") {
++      const filteredSessionData = params.sessionData.filter(item =>
++        this.messageHandler.matchesContext(item.contextDescriptor)
++      );
++      for (const event of [...this.#subscribedEvents]) {
++        const hasSessionItem = filteredSessionData.some(
++          item => item.value === event
++        );
++        if (!hasSessionItem) {
++          this.#unsubscribeEvent(event);
++        }
++      }
++      for (const { value } of filteredSessionData) {
++        this.#subscribeEvent(value);
++      }
++    }
++  }
++
++  static get supportedEvents() {
++    return ["termux.mediaRecordingStateChanged", "termux.mediaStreamDetected"];
++  }
++}
++
++export const termux = TermuxModule;
+--- a/remote/webdriver-bidi/modules/ModuleRegistry.sys.mjs
++++ b/remote/webdriver-bidi/modules/ModuleRegistry.sys.mjs
+@@ -35,6 +35,8 @@
+     "chrome://remote/content/webdriver-bidi/modules/root/session.sys.mjs",
+   storage:
+     "chrome://remote/content/webdriver-bidi/modules/root/storage.sys.mjs",
++  // Termux media recording (yamsergey.termux.packages patch 0036).
++  termux: "chrome://remote/content/webdriver-bidi/modules/root/termux.sys.mjs",
+   webExtension:
+     "chrome://remote/content/webdriver-bidi/modules/root/webExtension.sys.mjs",
+ });
+--- a/remote/webdriver-bidi/jar.mn
++++ b/remote/webdriver-bidi/jar.mn
+@@ -33,6 +33,7 @@
+   content/webdriver-bidi/modules/root/script.sys.mjs (modules/root/script.sys.mjs)
+   content/webdriver-bidi/modules/root/session.sys.mjs (modules/root/session.sys.mjs)
+   content/webdriver-bidi/modules/root/storage.sys.mjs (modules/root/storage.sys.mjs)
++  content/webdriver-bidi/modules/root/termux.sys.mjs (modules/root/termux.sys.mjs)
+   content/webdriver-bidi/modules/root/webExtension.sys.mjs (modules/root/webExtension.sys.mjs)
+ 
+   # WebDriver BiDi windowglobal modules

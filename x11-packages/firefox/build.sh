@@ -4,7 +4,7 @@ TERMUX_PKG_LICENSE="MPL-2.0"
 TERMUX_PKG_MAINTAINER="@termux"
 TERMUX_PKG_VERSION="156.0.1"
 # Wayland build (mozconfig.cfg); the revision tells it apart from the Termux package.
-TERMUX_PKG_REVISION=92
+TERMUX_PKG_REVISION=93
 TERMUX_PKG_SRCURL="https://archive.mozilla.org/pub/firefox/releases/${TERMUX_PKG_VERSION#*really}/source/firefox-${TERMUX_PKG_VERSION#*really}.source.tar.xz"
 TERMUX_PKG_SHA256=f8b0bf733efebebf9af98ead537598c2cf56c2c1b9c06bf89220ea6731b64724
 # ffmpeg and pulseaudio are dependencies through dlopen(3):
@@ -133,6 +133,9 @@ termux_step_make_install() {
 	install -Dm644 -t "${TERMUX_PREFIX}/lib/firefox/defaults/pref" "${TERMUX_PKG_BUILDER_DIR}/termux-gpu.js"
 	# The assistant's WebDriver BiDi on a private Unix socket (yamsergey.linux.android ADR 020, patch 0033).
 	install -Dm644 -t "${TERMUX_PREFIX}/lib/firefox/defaults/pref" "${TERMUX_PKG_BUILDER_DIR}/termux-assistant.js"
+	# Per-tab recording of streamed (MSE) media to disk (patches 0034-0037).
+	install -Dm644 -t "${TERMUX_PREFIX}/lib/firefox/defaults/pref" "${TERMUX_PKG_BUILDER_DIR}/termux-recording.js"
+	install -Dm755 -t "${TERMUX_PREFIX}/bin" "${TERMUX_PKG_BUILDER_DIR}/termux-firefox-recording-merge"
 
 	# Install icons as Arch Linux does
 	local i theme=official

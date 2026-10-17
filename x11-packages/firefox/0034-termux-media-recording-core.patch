@@ -1,0 +1,622 @@
+--- a/docshell/base/BrowsingContext.h
++++ b/docshell/base/BrowsingContext.h
+@@ -301,7 +301,11 @@
+   FIELD(IsDocumentPiP, bool)                                                  \
+   /* True if this is a content browsing context whose page has an open        \
+      Document Picture-in-Picture window */                                    \
+-  FIELD(ControlsDocumentPiP, bool)
++  FIELD(ControlsDocumentPiP, bool)                                            \
++  /* Termux (yamsergey.termux.packages patch 0034): while true, the           \
++     SourceBuffers of every document in this top-level browsing context       \
++     write the media segments they receive to disk. Parent-process only. */   \
++  FIELD(TermuxMediaRecording, bool)
+ 
+ #define NS_DOM_BROWSINGCONTEXT_IID \
+   {0x5059a6aa, 0xf09, 0x415c, {0x89, 0xbd, 0x63, 0xfd, 0xe5, 0xab, 0x1a, 0x66}};
+@@ -684,6 +688,9 @@
+   bool IsActive() const;
+   bool ForceOffline() const { return GetForceOffline(); }
+ 
++  // Termux patch 0034: read on the top-level browsing context by SourceBuffer.
++  bool TermuxMediaRecording() const { return GetTermuxMediaRecording(); }
++
+   nsILoadInfo::IPAddressSpace GetCurrentIPAddressSpace() const {
+     return GetIPAddressSpace();
+   }
+@@ -1572,6 +1579,12 @@
+   bool CanSet(FieldIndex<IDX_ForceOffline>, bool aNewValue,
+               ContentParent* aSource);
+ 
++  // Termux patch 0034: only chrome code in the parent process may toggle it.
++  bool CanSet(FieldIndex<IDX_TermuxMediaRecording>, const bool&,
++              ContentParent* aSource) {
++    return XRE_IsParentProcess() && !aSource;
++  }
++
+   bool CanSet(FieldIndex<IDX_InnerSizeSpoofedForRFP>, const CSSIntSize&,
+               ContentParent*) {
+     return IsTop();
+--- a/dom/chrome-webidl/BrowsingContext.webidl
++++ b/dom/chrome-webidl/BrowsingContext.webidl
+@@ -159,6 +159,13 @@
+   [SetterThrows] attribute boolean forceOffline;
+ 
+   /**
++   * Termux (patch 0034): while true, the SourceBuffers of every document in
++   * this top-level browsing context write the media segments they receive to
++   * disk (pref media.termux.recording.dir). Set it on the top context.
++   */
++  [SetterThrows] attribute boolean termuxMediaRecording;
++
++  /**
+    * Sets whether this is an app tab. Non-same-origin link navigations from app
+    * tabs may be forced to open in new contexts, rather than in the same context.
+    */
+--- a/dom/media/mediasource/TrackBuffersManager.h
++++ b/dom/media/mediasource/TrackBuffersManager.h
+@@ -22,6 +22,8 @@
+ #include "mozilla/dom/MediaDebugInfoBinding.h"
+ #include "nsTArray.h"
+ 
++#include <stdio.h>  // Termux patch 0034: FILE* for the media dump
++
+ namespace mozilla {
+ 
+ class AbstractThread;
+@@ -147,6 +149,23 @@
+ 
+   // Interface for MediaSourceDemuxer
+   MediaInfo GetMetadata() const;
++
++  // Termux patch 0034: media recording. The bytes handed to the demuxer (the
++  // complete init segment, then the media segments) are also written to
++  // <aDir>/<aBaseName>-pNNN.<aExt>; a new part starts whenever a new demuxer
++  // is created (new init segment, discontinuity, abort). Called on the main
++  // thread; the work happens on the task queue.
++  void SetDump(bool aEnabled, const nsACString& aDir,
++               const nsACString& aBaseName, const nsACString& aExt);
++  struct DumpStats {
++    bool mEnabled = false;
++    bool mError = false;
++    uint64_t mBytes = 0;
++    uint32_t mParts = 0;
++    int64_t mStartUs = -1;
++    int64_t mEndUs = -1;
++  };
++  DumpStats GetDumpStats() const;
+   const TrackBuffer& GetTrackBuffer(TrackInfo::TrackType aTrack) const;
+   const media::TimeIntervals& Buffered(TrackInfo::TrackType) const;
+   const media::TimeUnit& HighestStartTime(TrackInfo::TrackType) const;
+@@ -252,6 +271,35 @@
+   void AppendDataToCurrentInputBuffer(const MediaSpan& aData)
+       MOZ_REQUIRES(mTaskQueueCapability);
+ 
++  // Termux patch 0034: media dump, task queue only. These touch no member
++  // guarded by mTaskQueueCapability, so they carry no annotation.
++  void DoSetDump(bool aEnabled, const nsCString& aDir,
++                 const nsCString& aBaseName, const nsCString& aExt);
++  // The next write opens a new part.
++  void DumpRotate() { mDumpNeedsRotate = true; }
++  // A complete init segment: starts a new part.
++  void DumpWriteInit(MediaByteBuffer* aInit);
++  // Media segment bytes; dropped until the first segment boundary after
++  // the dump was enabled.
++  void DumpWriteMedia(const MediaSpan& aData);
++  void DumpWriteBytes(const uint8_t* aData, size_t aLength);
++  void DumpNoteSegment(const media::TimeUnit& aStart,
++                       const media::TimeUnit& aEnd);
++  void DumpClose();
++  FILE* mDumpFile = nullptr;
++  bool mDumpNeedsRotate = false;
++  bool mDumpAwaitSegment = false;
++  nsCString mDumpDir;
++  nsCString mDumpBaseName;
++  nsCString mDumpExt;
++  // Read from the main thread by SourceBuffer.
++  Atomic<bool> mDumpEnabled{false};
++  Atomic<bool> mDumpError{false};
++  Atomic<uint64_t> mDumpBytes{0};
++  Atomic<uint32_t> mDumpParts{0};
++  Atomic<int64_t> mDumpStartUs{-1};
++  Atomic<int64_t> mDumpEndUs{-1};
++
+   RefPtr<MediaByteBuffer> mInitData MOZ_GUARDED_BY(mTaskQueueCapability);
+ 
+   // Checks if a new set of init data is a repeat of the last set of init data
+--- a/dom/media/mediasource/TrackBuffersManager.cpp
++++ b/dom/media/mediasource/TrackBuffersManager.cpp
+@@ -18,7 +18,10 @@
+ #include "mozilla/ProfilerLabels.h"
+ #include "mozilla/ProfilerMarkers.h"
+ #include "mozilla/StaticPrefs_media.h"
++#include "mozilla/Unused.h"
+ #include "nsMimeTypes.h"
++#include "nsPrintfCString.h"
++#include "nsThreadUtils.h"
+ 
+ extern mozilla::LogModule* GetMediaSourceLog();
+ 
+@@ -105,7 +108,144 @@
+   DDLINKCHILD("parser", mParser.get());
+ }
+ 
+-TrackBuffersManager::~TrackBuffersManager() { ShutdownDemuxers(); }
++TrackBuffersManager::~TrackBuffersManager() {
++  DumpClose();
++  ShutdownDemuxers();
++}
++
++// Termux patch 0034: media recording.
++
++void TrackBuffersManager::SetDump(bool aEnabled, const nsACString& aDir,
++                                  const nsACString& aBaseName,
++                                  const nsACString& aExt) {
++  MOZ_ASSERT(NS_IsMainThread());
++  RefPtr<TaskQueue> taskQueue = GetTaskQueueSafe();
++  if (!taskQueue) {
++    return;
++  }
++  nsCString dir(aDir);
++  nsCString base(aBaseName);
++  nsCString ext(aExt);
++  Unused << taskQueue->Dispatch(NS_NewRunnableFunction(
++      "TrackBuffersManager::SetDump",
++      [self = RefPtr<TrackBuffersManager>(this), aEnabled, dir, base, ext]() {
++        self->DoSetDump(aEnabled, dir, base, ext);
++      }));
++}
++
++TrackBuffersManager::DumpStats TrackBuffersManager::GetDumpStats() const {
++  DumpStats stats;
++  stats.mEnabled = mDumpEnabled;
++  stats.mError = mDumpError;
++  stats.mBytes = mDumpBytes;
++  stats.mParts = mDumpParts;
++  stats.mStartUs = mDumpStartUs;
++  stats.mEndUs = mDumpEndUs;
++  return stats;
++}
++
++void TrackBuffersManager::DoSetDump(bool aEnabled, const nsCString& aDir,
++                                    const nsCString& aBaseName,
++                                    const nsCString& aExt) {
++  if (!aEnabled) {
++    DumpClose();
++    mDumpEnabled = false;
++    mDumpAwaitSegment = false;
++    mDumpNeedsRotate = false;
++    MSE_DEBUG("Dump off ({} bytes, {} parts)", uint64_t(mDumpBytes),
++              uint32_t(mDumpParts));
++    return;
++  }
++  if (mDumpEnabled) {
++    return;
++  }
++  mDumpDir = aDir;
++  mDumpBaseName = aBaseName;
++  mDumpExt = aExt;
++  mDumpBytes = 0;
++  mDumpParts = 0;
++  mDumpStartUs = -1;
++  mDumpEndUs = -1;
++  mDumpError = false;
++  // The current init segment is written, and media data copied, from the
++  // next segment boundary on (SegmentParserLoop).
++  mDumpNeedsRotate = true;
++  mDumpAwaitSegment = true;
++  mDumpEnabled = true;
++  MSE_DEBUG("Dump on: {}/{}-pNNN.{}", mDumpDir.get(), mDumpBaseName.get(),
++            mDumpExt.get());
++}
++
++void TrackBuffersManager::DumpWriteInit(MediaByteBuffer* aInit) {
++  if (!mDumpEnabled || !aInit || aInit->IsEmpty()) {
++    return;
++  }
++  mDumpNeedsRotate = true;
++  mDumpAwaitSegment = false;
++  DumpWriteBytes(aInit->Elements(), aInit->Length());
++}
++
++void TrackBuffersManager::DumpWriteMedia(const MediaSpan& aData) {
++  if (!mDumpEnabled || mDumpAwaitSegment) {
++    return;
++  }
++  DumpWriteBytes(aData.Elements(), aData.Length());
++}
++
++void TrackBuffersManager::DumpWriteBytes(const uint8_t* aData,
++                                         size_t aLength) {
++  if (!aLength) {
++    return;
++  }
++  if (mDumpNeedsRotate) {
++    DumpClose();
++    mDumpNeedsRotate = false;
++    uint32_t part = ++mDumpParts;
++    nsPrintfCString path("%s/%s-p%03u.%s", mDumpDir.get(),
++                         mDumpBaseName.get(), part, mDumpExt.get());
++    mDumpFile = fopen(path.get(), "wb");
++    if (!mDumpFile) {
++      MSE_DEBUG("Dump: cannot open {}", path.get());
++      mDumpError = true;
++      mDumpEnabled = false;
++      return;
++    }
++    MSE_DEBUG("Dump: part {} -> {}", part, path.get());
++  }
++  if (!mDumpFile) {
++    return;
++  }
++  size_t written = fwrite(aData, 1, aLength, mDumpFile);
++  // Keep the file complete on disk even while it stays open.
++  fflush(mDumpFile);
++  mDumpBytes += written;
++  if (written != aLength) {
++    MSE_DEBUG("Dump: short write ({} of {})", written, aLength);
++    mDumpError = true;
++  }
++}
++
++void TrackBuffersManager::DumpNoteSegment(const media::TimeUnit& aStart,
++                                          const media::TimeUnit& aEnd) {
++  if (!mDumpEnabled || mDumpAwaitSegment) {
++    return;
++  }
++  int64_t start = aStart.ToMicroseconds();
++  int64_t end = aEnd.ToMicroseconds();
++  if (mDumpStartUs < 0 || start < mDumpStartUs) {
++    mDumpStartUs = start;
++  }
++  if (end > mDumpEndUs) {
++    mDumpEndUs = end;
++  }
++}
++
++void TrackBuffersManager::DumpClose() {
++  if (mDumpFile) {
++    fclose(mDumpFile);
++    mDumpFile = nullptr;
++  }
++}
+ 
+ RefPtr<TrackBuffersManager::AppendPromise> TrackBuffersManager::AppendData(
+     already_AddRefed<MediaByteBuffer> aData,
+@@ -249,6 +389,7 @@
+       break;
+     case Type::Detach:
+       mCurrentInputBuffer = nullptr;
++      DumpClose();
+       MOZ_DIAGNOSTIC_ASSERT(mQueue.Length() == 0,
+                             "Detach task must be the last");
+       mVideoTracks.Reset();
+@@ -511,6 +652,7 @@
+     // The demuxer will be recreated during the next run of SegmentParserLoop.
+     // As such we don't need to notify it that data has been removed.
+     mCurrentInputBuffer = new SourceBufferResource();
++    DumpRotate();
+   }
+ 
+   // We could be left with a demuxer in an unusable state. It needs to be
+@@ -967,6 +1109,11 @@
+       if (NS_SUCCEEDED(haveMediaSegment)) {
+         SetAppendState(AppendState::PARSING_MEDIA_SEGMENT);
+         mNewMediaSegmentStarted = true;
++        if (mDumpEnabled && mDumpAwaitSegment && mInitData) {
++          // Termux patch 0034: the dump was enabled mid-stream. Start the
++          // part with the init segment in use, at this segment boundary.
++          DumpWriteInit(mInitData);
++        }
+         continue;
+       }
+       // We have neither an init segment nor a media segment.
+@@ -1004,6 +1151,11 @@
+         RejectAppend(newData, __func__);
+         return;
+       }
++      if (NS_SUCCEEDED(newData) &&
++          mSourceBufferAttributes->GetAppendState() ==
++              AppendState::PARSING_MEDIA_SEGMENT) {
++        DumpNoteSegment(start, end);  // Termux patch 0034
++      }
+       mProcessedInput += mInputBuffer->Length();
+     }
+ 
+@@ -1205,6 +1357,7 @@
+   // that data has been appended yet ; so we simply append the init segment
+   // to the resource.
+   mCurrentInputBuffer->AppendData(mParser->InitData());
++  DumpWriteInit(mParser->InitData());  // Termux patch 0034
+   CreateDemuxerforMIMEType();
+   if (!mInputDemuxer) {
+     RejectAppend(NS_ERROR_FAILURE, __func__);
+@@ -1274,6 +1427,7 @@
+     const MediaSpan& aData) {
+   MOZ_ASSERT(mCurrentInputBuffer);
+   mCurrentInputBuffer->AppendData(aData);
++  DumpWriteMedia(aData);  // Termux patch 0034
+   mInputDemuxer->NotifyDataArrived();
+ }
+ 
+@@ -1301,6 +1455,7 @@
+   // that data has been appended yet ; so we simply append the init segment
+   // to the resource.
+   mCurrentInputBuffer->AppendData(mParser->InitData());
++  DumpWriteInit(mParser->InitData());  // Termux patch 0034
+   uint32_t length = endInit - (mProcessedInput - mInputBuffer->Length());
+   MOZ_RELEASE_ASSERT(length <= mInputBuffer->Length());
+   mInputBuffer->RemoveFront(length);
+--- a/dom/media/mediasource/SourceBuffer.h
++++ b/dom/media/mediasource/SourceBuffer.h
+@@ -13,6 +13,7 @@
+ #include "mozilla/Atomics.h"
+ #include "mozilla/DOMEventTargetHelper.h"
+ #include "mozilla/MozPromise.h"
++#include "mozilla/TimeStamp.h"
+ #include "mozilla/dom/SourceBufferBinding.h"
+ #include "mozilla/dom/TypedArray.h"
+ #include "mozilla/mozalloc.h"
+@@ -172,6 +173,22 @@
+       const SourceBufferTask::AppendBufferResult& aResult);
+   void AppendDataErrored(const MediaResult& aError);
+ 
++  // Termux patch 0034: media recording. The top-level BrowsingContext's
++  // TermuxMediaRecording flag drives the TrackBuffersManager's dump; the state
++  // goes to chrome as the "termux-media-recording" observer notification
++  // (subject: the owner window, data: JSON).
++  void UpdateDumpState();
++  void ReportDumpState(const char* aState, bool aForce);
++  bool mDumpRequested = false;
++  bool mDumpNoDir = false;
++  uint32_t mDumpId = 0;
++  nsCString mDumpDir;
++  nsCString mDumpBaseName;
++  nsCString mDumpExt;
++  TimeStamp mDumpLastReport;
++  uint64_t mDumpLastBytes = 0;
++  nsCString mDumpLastState;
++
+   RefPtr<MediaSource> mMediaSource;
+   const RefPtr<AbstractThread> mAbstractMainThread;
+ 
+--- a/dom/media/mediasource/SourceBuffer.cpp
++++ b/dom/media/mediasource/SourceBuffer.cpp
+@@ -14,8 +14,15 @@
+ #include "mozilla/ErrorResult.h"
+ #include "mozilla/FloatingPoint.h"
+ #include "mozilla/Logging.h"
++#include "mozilla/Preferences.h"
++#include "mozilla/Services.h"
++#include "mozilla/dom/BrowsingContext.h"
+ #include "mozilla/dom/Document.h"
+ #include "mozilla/dom/MediaSourceBinding.h"
++#include "nsIObserverService.h"
++#include "nsIPrincipal.h"
++#include "nsPrintfCString.h"
++#include "nsReadableUtils.h"
+ #include "mozilla/dom/TimeRanges.h"
+ #include "mozilla/dom/TypedArray.h"
+ #include "nsError.h"
+@@ -449,6 +456,10 @@
+     MSE_DEBUG("Already detached");
+     return;
+   }
++  if (mDumpId) {
++    // Termux patch 0034: the track is gone; chrome drops it.
++    ReportDumpState("ended", true);
++  }
+   AbortBufferAppend();
+   if (mTrackBuffersManager) {
+     mMediaSource->GetDecoder()->GetDemuxer()->DetachSourceBuffer(
+@@ -571,6 +582,8 @@
+   MOZ_ASSERT(NS_IsMainThread());
+   MSE_DEBUG("AppendData(aLength={})", aData->Length());
+ 
++  UpdateDumpState();  // Termux patch 0034
++
+   StartUpdating();
+ 
+   mTrackBuffersManager->AppendData(aData.forget(), mCurrentAttributes)
+@@ -644,11 +657,202 @@
+ 
+   CheckEndTime();
+ 
++  if (mActive) {
++    // Termux patch 0034: tell chrome about the stream and the dump progress.
++    ReportDumpState(nullptr, false);
++  }
++
+   if (!mCompletionPromise.Exists()) {
+     StopUpdating();
+   }
+ }
+ 
++// Termux patch 0034: media recording.
++
++static void AppendJSONString(nsACString& aOut, const nsACString& aIn) {
++  aOut.Append('"');
++  for (uint32_t i = 0; i < aIn.Length(); i++) {
++    char c = aIn.CharAt(i);
++    switch (c) {
++      case '"':
++        aOut.AppendLiteral("\\\"");
++        break;
++      case '\\':
++        aOut.AppendLiteral("\\\\");
++        break;
++      case '\n':
++      case '\r':
++      case '\t':
++        aOut.Append(' ');
++        break;
++      default:
++        if (static_cast<unsigned char>(c) < 0x20) {
++          break;
++        }
++        aOut.Append(c);
++    }
++  }
++  aOut.Append('"');
++}
++
++void SourceBuffer::UpdateDumpState() {
++  MOZ_ASSERT(NS_IsMainThread());
++  if (!mMediaSource || !mTrackBuffersManager) {
++    return;
++  }
++  nsPIDOMWindowInner* window = mMediaSource->GetOwnerWindow();
++  Document* doc = window ? window->GetExtantDoc() : nullptr;
++  BrowsingContext* bc = doc ? doc->GetBrowsingContext() : nullptr;
++  bool want = bc && bc->Top() && bc->Top()->TermuxMediaRecording();
++  if (want == mDumpRequested) {
++    return;
++  }
++  mDumpRequested = want;
++  mDumpNoDir = false;
++  if (!want) {
++    mTrackBuffersManager->SetDump(false, ""_ns, ""_ns, ""_ns);
++    ReportDumpState(nullptr, true);
++    return;
++  }
++
++  nsAutoCString dir;
++  Preferences::GetCString("media.termux.recording.dir", dir);
++  if (dir.IsEmpty()) {
++    MSE_DEBUG("Dump requested but media.termux.recording.dir is empty");
++    mDumpNoDir = true;
++    ReportDumpState(nullptr, true);
++    return;
++  }
++  dir.Trim("/", false, true);
++
++  // <unix time>-<host>-<video|audio>-<id>, part and extension added by the
++  // TrackBuffersManager.
++  nsAutoCString host;
++  if (doc->NodePrincipal()) {
++    doc->NodePrincipal()->GetAsciiHost(host);
++  }
++  if (host.IsEmpty()) {
++    host.AssignLiteral("page");
++  }
++  for (size_t i = 0; i < host.Length(); i++) {
++    char c = host.CharAt(i);
++    bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
++              (c >= '0' && c <= '9') || c == '.' || c == '-';
++    if (!ok) {
++      host.SetCharAt('_', i);
++    }
++  }
++  const char* kind =
++      mType.ExtendedType().Type().HasAudioMajorType() ? "audio" : "video";
++  mDumpDir = dir;
++  mDumpBaseName = nsPrintfCString("%lld-%s-%s-%u", (long long)time(nullptr),
++                                  host.get(), kind, mDumpId);
++  mDumpExt = StringEndsWith(mType.Type().AsString(), "/webm"_ns) ? "webm"_ns
++                                                                  : "mp4"_ns;
++  mTrackBuffersManager->SetDump(true, mDumpDir, mDumpBaseName, mDumpExt);
++  ReportDumpState(nullptr, true);
++}
++
++void SourceBuffer::ReportDumpState(const char* aState, bool aForce) {
++  MOZ_ASSERT(NS_IsMainThread());
++  if (!mMediaSource || !mTrackBuffersManager) {
++    return;
++  }
++  nsPIDOMWindowInner* window = mMediaSource->GetOwnerWindow();
++  if (!window) {
++    return;
++  }
++  if (!mDumpId) {
++    static uint32_t sNextDumpId = 0;
++    mDumpId = ++sNextDumpId;
++  }
++
++  TrackBuffersManager::DumpStats stats = mTrackBuffersManager->GetDumpStats();
++  nsAutoCString state;
++  if (aState) {
++    state.Assign(aState);
++  } else if (mDumpNoDir || stats.mError) {
++    state.AssignLiteral("error");
++  } else if (mDumpRequested) {
++    state.AssignLiteral("recording");
++  } else {
++    state.AssignLiteral("idle");
++  }
++
++  TimeStamp now = TimeStamp::Now();
++  if (!aForce && state == mDumpLastState && !mDumpLastReport.IsNull()) {
++    bool quiet = stats.mBytes == mDumpLastBytes;
++    double since = (now - mDumpLastReport).ToMilliseconds();
++    // Idle streams every 5 s (keeps the stream known to chrome), recordings
++    // once a second.
++    if (since < (quiet ? 5000.0 : 1000.0)) {
++      return;
++    }
++  }
++  mDumpLastReport = now;
++  mDumpLastBytes = stats.mBytes;
++  mDumpLastState = state;
++
++  MediaInfo info = mTrackBuffersManager->GetMetadata();
++  const char* kind =
++      mType.ExtendedType().Type().HasAudioMajorType() ? "audio" : "video";
++  nsAutoCString codec;
++  if (info.HasVideo()) {
++    codec = info.mVideo.mMimeType;
++  } else if (info.HasAudio()) {
++    codec = info.mAudio.mMimeType;
++  }
++
++  nsAutoCString json;
++  json.AppendLiteral("{\"id\":");
++  json.AppendInt(mDumpId);
++  json.AppendLiteral(",\"state\":");
++  AppendJSONString(json, state);
++  json.AppendLiteral(",\"kind\":\"");
++  json.Append(kind);
++  json.AppendLiteral("\",\"mime\":");
++  AppendJSONString(json, mType.OriginalString());
++  json.AppendLiteral(",\"encrypted\":");
++  json.Append(info.IsEncrypted() ? "true" : "false");
++  json.AppendLiteral(",\"width\":");
++  json.AppendInt(info.HasVideo() ? info.mVideo.mDisplay.width : 0);
++  json.AppendLiteral(",\"height\":");
++  json.AppendInt(info.HasVideo() ? info.mVideo.mDisplay.height : 0);
++  json.AppendLiteral(",\"rate\":");
++  json.AppendInt(info.HasAudio() ? info.mAudio.mRate : 0u);
++  json.AppendLiteral(",\"channels\":");
++  json.AppendInt(info.HasAudio() ? info.mAudio.mChannels : 0u);
++  json.AppendLiteral(",\"codec\":");
++  AppendJSONString(json, codec);
++  json.AppendLiteral(",\"noDir\":");
++  json.Append(mDumpNoDir ? "true" : "false");
++  json.AppendLiteral(",\"writeError\":");
++  json.Append(stats.mError ? "true" : "false");
++  json.AppendLiteral(",\"bytes\":");
++  json.AppendInt(stats.mBytes);
++  json.AppendLiteral(",\"parts\":");
++  json.AppendInt(stats.mParts);
++  json.AppendLiteral(",\"startUs\":");
++  json.AppendInt(stats.mStartUs);
++  json.AppendLiteral(",\"endUs\":");
++  json.AppendInt(stats.mEndUs);
++  json.AppendLiteral(",\"dir\":");
++  AppendJSONString(json, mDumpDir);
++  json.AppendLiteral(",\"base\":");
++  AppendJSONString(json, mDumpBaseName);
++  json.AppendLiteral(",\"ext\":");
++  AppendJSONString(json, mDumpExt);
++  json.Append('}');
++
++  nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
++  if (!obs) {
++    return;
++  }
++  nsCOMPtr<nsISupports> subject = do_QueryInterface(window);
++  obs->NotifyObservers(subject, "termux-media-recording",
++                       NS_ConvertUTF8toUTF16(json).get());
++}
++
+ void SourceBuffer::AppendDataErrored(const MediaResult& aError) {
+   MOZ_ASSERT(mUpdating);
+   mPendingAppend.Complete();
