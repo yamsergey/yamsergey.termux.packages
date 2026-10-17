@@ -1,5 +1,5 @@
 --- /dev/null
-+++ b/toolkit/components/termux/moz.build
++++ /private/tmp/claude-501/-Users-yamsergey-work-projects-firefox/2aa53a9f-c417-42fc-872f-3e38dd96f6e3/scratchpad/tree/b/toolkit/components/termux/moz.build	2026-10-17 09:03:16.145609919 +0200
 @@ -0,0 +1,11 @@
 +# -*- Mode: python; indent-tabs-mode: nil; tab-width: 40 -*-
 +# vim: set filetype=python:
@@ -13,8 +13,8 @@
 +    "TermuxMediaRecording.sys.mjs",
 +]
 --- /dev/null
-+++ b/toolkit/components/termux/TermuxMediaRecording.sys.mjs
-@@ -0,0 +1,701 @@
++++ /private/tmp/claude-501/-Users-yamsergey-work-projects-firefox/2aa53a9f-c417-42fc-872f-3e38dd96f6e3/scratchpad/tree/b/toolkit/components/termux/TermuxMediaRecording.sys.mjs	2026-10-17 18:32:48.219707284 +0200
+@@ -0,0 +1,762 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -531,7 +531,11 @@
 +        continue;
 +      }
 +      if (!byKind.has(track.kind)) {
-+        byKind.set(track.kind, { files: [], durationMs: 0 });
++        byKind.set(track.kind, {
++          files: [],
++          durationMs: 0,
++          startUs: Infinity,
++        });
 +      }
 +      const entry = byKind.get(track.kind);
 +      entry.files.push(...track.files);
@@ -540,6 +544,7 @@
 +          entry.durationMs,
 +          (track.endUs - track.startUs) / 1000
 +        );
++        entry.startUs = Math.min(entry.startUs, track.startUs);
 +      }
 +      if (track.files.some(f => f.endsWith(".webm"))) {
 +        webm = true;
@@ -573,7 +578,7 @@
 +    // 1. One file per track.
 +    for (const [kind, entry] of byKind) {
 +      if (entry.files.length === 1) {
-+        inputs.push(entry.files[0]);
++        inputs.push({ path: entry.files[0], kind });
 +        continue;
 +      }
 +      const list = `${prefix}-${kind}.concat.txt`;
@@ -592,14 +597,32 @@
 +        report
 +      );
 +      done++;
-+      inputs.push(merged);
++      inputs.push({ path: merged, kind });
 +    }
 +
-+    // 2. Mux them together.
-+    const args = [];
++    // 2. Mux them together, keeping the tracks' relative start. ffmpeg
++    // rebases every input to zero, and the video and audio buffers rarely
++    // begin at the same instant (YouTube: seconds apart), so each input is
++    // shifted by its start relative to the earliest one. ffprobe reads the
++    // real file start; the parser's segment times are the fallback.
++    const starts = [];
 +    for (const input of inputs) {
-+      args.push("-i", input);
++      let start = await this._probeStart(ffmpeg, input.path);
++      if (start === null) {
++        const entry = byKind.get(input.kind);
++        start = Number.isFinite(entry.startUs) ? entry.startUs / 1e6 : null;
++      }
++      starts.push(start);
 +    }
++    const earliest = starts.every(s => s !== null) ? Math.min(...starts) : null;
++    const args = [];
++    inputs.forEach((input, i) => {
++      const offset = earliest === null ? 0 : starts[i] - earliest;
++      if (offset > 0.001) {
++        args.push("-itsoffset", offset.toFixed(6));
++      }
++      args.push("-i", input.path);
++    });
 +    args.push("-c", "copy");
 +    if (!webm) {
 +      args.push("-movflags", "+faststart");
@@ -642,6 +665,44 @@
 +    this._history.push(summary);
 +    await this._writeSummary(session, summary);
 +    this._emit("state-changed", session);
++  },
++
++  /**
++   * The start time of a media file in seconds via ffprobe (next to ffmpeg),
++   * or null when it cannot be determined.
++   */
++  async _probeStart(ffmpeg, file) {
++    const ffprobe = ffmpeg.replace(/ffmpeg([^/]*)$/, "ffprobe$1");
++    if (ffprobe === ffmpeg || !(await IOUtils.exists(ffprobe))) {
++      return null;
++    }
++    try {
++      const proc = await lazy.Subprocess.call({
++        command: ffprobe,
++        arguments: [
++          "-v",
++          "error",
++          "-show_entries",
++          "format=start_time",
++          "-of",
++          "default=noprint_wrappers=1:nokey=1",
++          file,
++        ],
++      });
++      let out = "";
++      for (;;) {
++        const chunk = await proc.stdout.readString();
++        if (!chunk) {
++          break;
++        }
++        out += chunk;
++      }
++      const { exitCode } = await proc.wait();
++      const start = parseFloat(out);
++      return exitCode === 0 && Number.isFinite(start) ? start : null;
++    } catch (e) {
++      return null;
++    }
 +  },
 +
 +  async _ffmpegPath() {
@@ -716,8 +777,8 @@
 +    }
 +  },
 +};
---- a/toolkit/components/moz.build
-+++ b/toolkit/components/moz.build
+--- /private/tmp/claude-501/-Users-yamsergey-work-projects-firefox/2aa53a9f-c417-42fc-872f-3e38dd96f6e3/scratchpad/tree/a/toolkit/components/moz.build	2026-10-17 08:56:06.356832607 +0200
++++ /private/tmp/claude-501/-Users-yamsergey-work-projects-firefox/2aa53a9f-c417-42fc-872f-3e38dd96f6e3/scratchpad/tree/b/toolkit/components/moz.build	2026-10-17 09:05:15.543488555 +0200
 @@ -83,6 +83,7 @@
      "startup",
      "statusfilter",
@@ -727,7 +788,7 @@
      "thumbnails",
      "timermanager",
 --- /dev/null
-+++ b/toolkit/actors/TermuxMediaRecordingChild.sys.mjs
++++ /private/tmp/claude-501/-Users-yamsergey-work-projects-firefox/2aa53a9f-c417-42fc-872f-3e38dd96f6e3/scratchpad/tree/b/toolkit/actors/TermuxMediaRecordingChild.sys.mjs	2026-10-17 09:03:24.107849112 +0200
 @@ -0,0 +1,48 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -778,7 +839,7 @@
 +  }
 +}
 --- /dev/null
-+++ b/toolkit/actors/TermuxMediaRecordingParent.sys.mjs
++++ /private/tmp/claude-501/-Users-yamsergey-work-projects-firefox/2aa53a9f-c417-42fc-872f-3e38dd96f6e3/scratchpad/tree/b/toolkit/actors/TermuxMediaRecordingParent.sys.mjs	2026-10-17 09:03:28.488589175 +0200
 @@ -0,0 +1,22 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -802,8 +863,8 @@
 +    }
 +  }
 +}
---- a/toolkit/actors/moz.build
-+++ b/toolkit/actors/moz.build
+--- /private/tmp/claude-501/-Users-yamsergey-work-projects-firefox/2aa53a9f-c417-42fc-872f-3e38dd96f6e3/scratchpad/tree/a/toolkit/actors/moz.build	2026-10-17 08:56:06.344476541 +0200
++++ /private/tmp/claude-501/-Users-yamsergey-work-projects-firefox/2aa53a9f-c417-42fc-872f-3e38dd96f6e3/scratchpad/tree/b/toolkit/actors/moz.build	2026-10-17 09:05:13.774122989 +0200
 @@ -69,6 +69,8 @@
      "RemotePageChild.sys.mjs",
      "SelectChild.sys.mjs",
@@ -813,8 +874,8 @@
      "ThumbnailsChild.sys.mjs",
      "TLSCertificateBindingChild.sys.mjs",
      "UAWidgetsChild.sys.mjs",
---- a/toolkit/modules/ActorManagerParent.sys.mjs
-+++ b/toolkit/modules/ActorManagerParent.sys.mjs
+--- /private/tmp/claude-501/-Users-yamsergey-work-projects-firefox/2aa53a9f-c417-42fc-872f-3e38dd96f6e3/scratchpad/tree/a/toolkit/modules/ActorManagerParent.sys.mjs	2026-10-17 08:56:06.350756034 +0200
++++ /private/tmp/claude-501/-Users-yamsergey-work-projects-firefox/2aa53a9f-c417-42fc-872f-3e38dd96f6e3/scratchpad/tree/b/toolkit/modules/ActorManagerParent.sys.mjs	2026-10-17 18:11:56.821929249 +0200
 @@ -613,6 +613,25 @@
      safeForUntrustedWebProcess: true,
    },

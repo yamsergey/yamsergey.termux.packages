@@ -1,5 +1,5 @@
 --- /dev/null
-+++ b/browser/components/termux/moz.build
++++ /private/tmp/claude-501/-Users-yamsergey-work-projects-firefox/2aa53a9f-c417-42fc-872f-3e38dd96f6e3/scratchpad/tree/b/browser/components/termux/moz.build	2026-10-17 09:03:54.923234452 +0200
 @@ -0,0 +1,11 @@
 +# -*- Mode: python; indent-tabs-mode: nil; tab-width: 40 -*-
 +# vim: set filetype=python:
@@ -13,7 +13,7 @@
 +    "TermuxRecordingUI.sys.mjs",
 +]
 --- /dev/null
-+++ b/browser/components/termux/TermuxRecordingUI.sys.mjs
++++ /private/tmp/claude-501/-Users-yamsergey-work-projects-firefox/2aa53a9f-c417-42fc-872f-3e38dd96f6e3/scratchpad/tree/b/browser/components/termux/TermuxRecordingUI.sys.mjs	2026-10-17 18:32:29.784314110 +0200
 @@ -0,0 +1,480 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -130,7 +130,7 @@
 +  },
 +
 +  _onWidgetCreated(node) {
-+    const win = node.ownerGlobal;
++    const win = node.ownerDocument.defaultView;
 +    node.setAttribute("image", ICON_IDLE);
 +    node.hidden = true;
 +    this._entries.set(win, { node, panel: null });
@@ -167,7 +167,7 @@
 +
 +  _onCommand(event) {
 +    const node = event.target;
-+    const win = node.ownerGlobal;
++    const win = node.ownerDocument.defaultView;
 +    const entry = this._entries.get(win);
 +    if (!entry) {
 +      return;
@@ -495,8 +495,8 @@
 +    content.appendChild(buttons);
 +  },
 +};
---- a/browser/components/moz.build
-+++ b/browser/components/moz.build
+--- /private/tmp/claude-501/-Users-yamsergey-work-projects-firefox/2aa53a9f-c417-42fc-872f-3e38dd96f6e3/scratchpad/tree/a/browser/components/moz.build	2026-10-17 08:56:06.382569167 +0200
++++ /private/tmp/claude-501/-Users-yamsergey-work-projects-firefox/2aa53a9f-c417-42fc-872f-3e38dd96f6e3/scratchpad/tree/b/browser/components/moz.build	2026-10-17 09:05:17.358324802 +0200
 @@ -75,6 +75,7 @@
      "tabnotes",
      "tabunloader",
@@ -505,8 +505,8 @@
      "textrecognition",
      "topsites",
      "translations",
---- a/browser/components/BrowserGlue.sys.mjs
-+++ b/browser/components/BrowserGlue.sys.mjs
+--- /private/tmp/claude-501/-Users-yamsergey-work-projects-firefox/2aa53a9f-c417-42fc-872f-3e38dd96f6e3/scratchpad/tree/a/browser/components/BrowserGlue.sys.mjs	2026-10-17 08:56:06.375796127 +0200
++++ /private/tmp/claude-501/-Users-yamsergey-work-projects-firefox/2aa53a9f-c417-42fc-872f-3e38dd96f6e3/scratchpad/tree/b/browser/components/BrowserGlue.sys.mjs	2026-10-17 09:05:23.407405962 +0200
 @@ -77,6 +77,8 @@
    TelemetryReportingPolicy:
      "resource://gre/modules/TelemetryReportingPolicy.sys.mjs",
