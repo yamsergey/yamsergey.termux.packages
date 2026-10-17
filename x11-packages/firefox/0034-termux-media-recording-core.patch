@@ -125,18 +125,16 @@
    // Checks if a new set of init data is a repeat of the last set of init data
 --- a/dom/media/mediasource/TrackBuffersManager.cpp
 +++ b/dom/media/mediasource/TrackBuffersManager.cpp
-@@ -18,7 +18,10 @@
- #include "mozilla/ProfilerLabels.h"
+@@ -19,6 +19,8 @@
  #include "mozilla/ProfilerMarkers.h"
  #include "mozilla/StaticPrefs_media.h"
-+#include "mozilla/Unused.h"
  #include "nsMimeTypes.h"
 +#include "nsPrintfCString.h"
 +#include "nsThreadUtils.h"
  
  extern mozilla::LogModule* GetMediaSourceLog();
  
-@@ -105,7 +108,144 @@
+@@ -105,7 +107,144 @@
    DDLINKCHILD("parser", mParser.get());
  }
  
@@ -159,7 +157,7 @@
 +  nsCString dir(aDir);
 +  nsCString base(aBaseName);
 +  nsCString ext(aExt);
-+  Unused << taskQueue->Dispatch(NS_NewRunnableFunction(
++  (void)taskQueue->Dispatch(NS_NewRunnableFunction(
 +      "TrackBuffersManager::SetDump",
 +      [self = RefPtr<TrackBuffersManager>(this), aEnabled, dir, base, ext]() {
 +        self->DoSetDump(aEnabled, dir, base, ext);
@@ -282,7 +280,7 @@
  
  RefPtr<TrackBuffersManager::AppendPromise> TrackBuffersManager::AppendData(
      already_AddRefed<MediaByteBuffer> aData,
-@@ -249,6 +389,7 @@
+@@ -249,6 +388,7 @@
        break;
      case Type::Detach:
        mCurrentInputBuffer = nullptr;
@@ -290,7 +288,7 @@
        MOZ_DIAGNOSTIC_ASSERT(mQueue.Length() == 0,
                              "Detach task must be the last");
        mVideoTracks.Reset();
-@@ -511,6 +652,7 @@
+@@ -511,6 +651,7 @@
      // The demuxer will be recreated during the next run of SegmentParserLoop.
      // As such we don't need to notify it that data has been removed.
      mCurrentInputBuffer = new SourceBufferResource();
@@ -298,7 +296,7 @@
    }
  
    // We could be left with a demuxer in an unusable state. It needs to be
-@@ -967,6 +1109,11 @@
+@@ -967,6 +1108,11 @@
        if (NS_SUCCEEDED(haveMediaSegment)) {
          SetAppendState(AppendState::PARSING_MEDIA_SEGMENT);
          mNewMediaSegmentStarted = true;
@@ -310,7 +308,7 @@
          continue;
        }
        // We have neither an init segment nor a media segment.
-@@ -1004,6 +1151,11 @@
+@@ -1004,6 +1150,11 @@
          RejectAppend(newData, __func__);
          return;
        }
@@ -322,7 +320,7 @@
        mProcessedInput += mInputBuffer->Length();
      }
  
-@@ -1205,6 +1357,7 @@
+@@ -1205,6 +1356,7 @@
    // that data has been appended yet ; so we simply append the init segment
    // to the resource.
    mCurrentInputBuffer->AppendData(mParser->InitData());
@@ -330,7 +328,7 @@
    CreateDemuxerforMIMEType();
    if (!mInputDemuxer) {
      RejectAppend(NS_ERROR_FAILURE, __func__);
-@@ -1274,6 +1427,7 @@
+@@ -1274,6 +1426,7 @@
      const MediaSpan& aData) {
    MOZ_ASSERT(mCurrentInputBuffer);
    mCurrentInputBuffer->AppendData(aData);
@@ -338,7 +336,7 @@
    mInputDemuxer->NotifyDataArrived();
  }
  
-@@ -1301,6 +1455,7 @@
+@@ -1301,6 +1454,7 @@
    // that data has been appended yet ; so we simply append the init segment
    // to the resource.
    mCurrentInputBuffer->AppendData(mParser->InitData());
