@@ -14,7 +14,7 @@
 +]
 --- /dev/null
 +++ b/toolkit/components/termux/TermuxMediaRecording.sys.mjs
-@@ -0,0 +1,645 @@
+@@ -0,0 +1,701 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -112,6 +112,61 @@
 +    }
 +  }
 +  return files;
++}
++
++const REPORT_STATES = new Set(["idle", "recording", "error", "ended"]);
++// What SourceBuffer::UpdateDumpState generates: <time>-<host>-<kind>-<id>.
++const BASE_NAME = /^\d{1,20}-[A-Za-z0-9._-]{1,200}-(video|audio)-\d{1,10}$/;
++const EXTENSIONS = new Set(["mp4", "webm"]);
++
++/**
++ * A report comes from a web content process, which an attacker may control
++ * (the actor is safeForUntrustedWebProcess). Keep only the expected shape and
++ * never take a path from it: the directory is this process's pref and the
++ * base name has to match the pattern SourceBuffer produces, else the track
++ * has no files.
++ */
++function sanitizeReport(raw) {
++  if (!raw || typeof raw !== "object") {
++    return null;
++  }
++  const str = (value, max) =>
++    typeof value === "string" ? value.slice(0, max) : "";
++  const int = (value, fallback = 0) =>
++    typeof value === "number" && Number.isFinite(value)
++      ? Math.trunc(value)
++      : fallback;
++  const id = int(raw.id, -1);
++  if (id < 0 || !REPORT_STATES.has(raw.state)) {
++    return null;
++  }
++  const base = str(raw.base, 256);
++  const ext = str(raw.ext, 8);
++  const hasFiles = BASE_NAME.test(base) && EXTENSIONS.has(ext);
++  const dir = Services.prefs.getStringPref(PREF_DIR, "").replace(/\/+$/, "");
++  return {
++    id,
++    state: raw.state,
++    kind: raw.kind === "audio" ? "audio" : "video",
++    mime: str(raw.mime, 256),
++    codec: str(raw.codec, 128),
++    encrypted: !!raw.encrypted,
++    width: Math.max(0, int(raw.width)),
++    height: Math.max(0, int(raw.height)),
++    rate: Math.max(0, int(raw.rate)),
++    channels: Math.max(0, int(raw.channels)),
++    noDir: !!raw.noDir,
++    writeError: !!raw.writeError,
++    bytes: Math.max(0, int(raw.bytes)),
++    parts: hasFiles ? Math.min(9999, Math.max(0, int(raw.parts))) : 0,
++    startUs: int(raw.startUs, -1),
++    endUs: int(raw.endUs, -1),
++    dir: hasFiles ? dir : "",
++    base: hasFiles ? base : "",
++    ext: hasFiles ? ext : "",
++    title: str(raw.title, 512),
++    url: str(raw.url, 2048),
++  };
 +}
 +
 +export const TermuxMediaRecording = {
@@ -248,9 +303,10 @@
 +   * Called by TermuxMediaRecordingParent for every report from a content
 +   * process.
 +   */
-+  onContentState(actor, data) {
++  onContentState(actor, rawData) {
++    const data = sanitizeReport(rawData);
 +    const browsingContext = actor.browsingContext;
-+    if (!browsingContext) {
++    if (!data || !browsingContext) {
 +      return;
 +    }
 +    const top = browsingContext.top;
@@ -759,7 +815,7 @@
      "UAWidgetsChild.sys.mjs",
 --- a/toolkit/modules/ActorManagerParent.sys.mjs
 +++ b/toolkit/modules/ActorManagerParent.sys.mjs
-@@ -613,6 +613,22 @@
+@@ -613,6 +613,25 @@
      safeForUntrustedWebProcess: true,
    },
  
@@ -777,6 +833,9 @@
 +    },
 +
 +    allFrames: true,
++    // The child side lives in web content processes (Firefox 156 refuses to
++    // create the actor there otherwise); the parent sanitizes every report.
++    safeForUntrustedWebProcess: true,
 +  },
 +
    Thumbnails: {
