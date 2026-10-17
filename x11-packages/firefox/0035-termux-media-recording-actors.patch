@@ -1,0 +1,904 @@
+--- /dev/null
++++ b/toolkit/components/termux/moz.build
+@@ -0,0 +1,11 @@
++# -*- Mode: python; indent-tabs-mode: nil; tab-width: 40 -*-
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++# Termux media recording (yamsergey.termux.packages patch 0035).
++
++MOZ_SRC_FILES += [
++    "TermuxMediaRecording.sys.mjs",
++]
+--- /dev/null
++++ b/toolkit/components/termux/TermuxMediaRecording.sys.mjs
+@@ -0,0 +1,762 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++/**
++ * Termux media recording (yamsergey.termux.packages patch 0035).
++ *
++ * Parent-process state for the per-tab media recorder. The content side
++ * (SourceBuffer, patch 0034) reports every MSE track of a document through the
++ * TermuxMediaRecording JSWindowActor; this module keeps one session per
++ * top-level browsing context, flips the BrowsingContext's
++ * `termuxMediaRecording` flag to start and stop, and tells its listeners:
++ *
++ *   "stream-detected"  (state)  a tab gained its first MSE track
++ *   "state-changed"    (state)  anything else changed (at most ~1/s per track)
++ *
++ * The toolbar button (browser/components/termux) and the WebDriver BiDi
++ * "termux" module are the consumers.
++ */
++
++const lazy = {};
++
++ChromeUtils.defineESModuleGetters(lazy, {
++  Subprocess: "resource://gre/modules/Subprocess.sys.mjs",
++});
++
++const PREF_DIR = "media.termux.recording.dir";
++const PREF_FFMPEG = "media.termux.recording.ffmpeg";
++const PREF_KEEP_PARTS = "media.termux.recording.keepParts";
++
++class Listeners {
++  #fns = new Set();
++
++  add(fn) {
++    this.#fns.add(fn);
++  }
++
++  remove(fn) {
++    this.#fns.delete(fn);
++  }
++
++  emit(...args) {
++    for (const fn of [...this.#fns]) {
++      try {
++        fn(...args);
++      } catch (e) {
++        console.error("TermuxMediaRecording listener failed", e);
++      }
++    }
++  }
++}
++
++/**
++ * Everything known about the media in one top-level browsing context.
++ */
++class Session {
++  constructor(topBrowsingContext) {
++    this.browsingContext = topBrowsingContext;
++    this.browsingContextId = topBrowsingContext.id;
++    // `${innerWindowId}:${trackId}` -> last report from the content process.
++    this.tracks = new Map();
++    // JSWindowActorParent instances that reported a track (for SeekToStart).
++    this.actors = new Set();
++    // idle | recording | paused | saving | ready | partial | error
++    this.status = "idle";
++    this.startedAt = null;
++    this.stoppedAt = null;
++    this.fromBeginning = false;
++    this.dir = "";
++    this.title = "";
++    this.url = "";
++    this.origin = "";
++    this.summaryPath = null;
++    // Merge (status "saving" and after).
++    this.progress = 0;
++    this.output = null;
++    this.outputBytes = 0;
++    this.endedByPage = false;
++    this.mergeError = null;
++    // Reports from the content side after a stop are not part of this
++    // recording any more.
++    this.frozenTracks = null;
++  }
++}
++
++function fileName(track, part) {
++  return `${track.dir}/${track.base}-p${String(part).padStart(3, "0")}.${track.ext}`;
++}
++
++function trackFiles(track) {
++  const files = [];
++  if (track.base && track.dir) {
++    for (let part = 1; part <= (track.parts || 0); part++) {
++      files.push(fileName(track, part));
++    }
++  }
++  return files;
++}
++
++const REPORT_STATES = new Set(["idle", "recording", "error", "ended"]);
++// What SourceBuffer::UpdateDumpState generates: <time>-<host>-<kind>-<id>.
++const BASE_NAME = /^\d{1,20}-[A-Za-z0-9._-]{1,200}-(video|audio)-\d{1,10}$/;
++const EXTENSIONS = new Set(["mp4", "webm"]);
++
++/**
++ * A report comes from a web content process, which an attacker may control
++ * (the actor is safeForUntrustedWebProcess). Keep only the expected shape and
++ * never take a path from it: the directory is this process's pref and the
++ * base name has to match the pattern SourceBuffer produces, else the track
++ * has no files.
++ */
++function sanitizeReport(raw) {
++  if (!raw || typeof raw !== "object") {
++    return null;
++  }
++  const str = (value, max) =>
++    typeof value === "string" ? value.slice(0, max) : "";
++  const int = (value, fallback = 0) =>
++    typeof value === "number" && Number.isFinite(value)
++      ? Math.trunc(value)
++      : fallback;
++  const id = int(raw.id, -1);
++  if (id < 0 || !REPORT_STATES.has(raw.state)) {
++    return null;
++  }
++  const base = str(raw.base, 256);
++  const ext = str(raw.ext, 8);
++  const hasFiles = BASE_NAME.test(base) && EXTENSIONS.has(ext);
++  const dir = Services.prefs.getStringPref(PREF_DIR, "").replace(/\/+$/, "");
++  return {
++    id,
++    state: raw.state,
++    kind: raw.kind === "audio" ? "audio" : "video",
++    mime: str(raw.mime, 256),
++    codec: str(raw.codec, 128),
++    encrypted: !!raw.encrypted,
++    width: Math.max(0, int(raw.width)),
++    height: Math.max(0, int(raw.height)),
++    rate: Math.max(0, int(raw.rate)),
++    channels: Math.max(0, int(raw.channels)),
++    noDir: !!raw.noDir,
++    writeError: !!raw.writeError,
++    bytes: Math.max(0, int(raw.bytes)),
++    parts: hasFiles ? Math.min(9999, Math.max(0, int(raw.parts))) : 0,
++    startUs: int(raw.startUs, -1),
++    endUs: int(raw.endUs, -1),
++    dir: hasFiles ? dir : "",
++    base: hasFiles ? base : "",
++    ext: hasFiles ? ext : "",
++    title: str(raw.title, 512),
++    url: str(raw.url, 2048),
++  };
++}
++
++export const TermuxMediaRecording = {
++  _sessions: new Map(),
++  _history: [],
++  _listeners: new Map([
++    ["stream-detected", new Listeners()],
++    ["state-changed", new Listeners()],
++  ]),
++
++  on(event, fn) {
++    this._listeners.get(event)?.add(fn);
++  },
++
++  off(event, fn) {
++    this._listeners.get(event)?.remove(fn);
++  },
++
++  _emit(event, session) {
++    this._listeners.get(event)?.emit(this._stateOf(session));
++  },
++
++  /**
++   * The recorder's view of one top-level browsing context, or null when no
++   * media was seen there and nothing was started.
++   */
++  getState(browsingContext) {
++    const session = this._sessionFor(browsingContext, false);
++    return session ? this._stateOf(session) : null;
++  },
++
++  /**
++   * Finished recordings (newest last) plus the ones running or saving now.
++   */
++  listRecordings() {
++    const live = [];
++    for (const session of this._sessions.values()) {
++      if (
++        session.status === "recording" ||
++        session.status === "paused" ||
++        session.status === "saving"
++      ) {
++        live.push(this._stateOf(session));
++      }
++    }
++    return [...this._history, ...live];
++  },
++
++  async start(browsingContext, { fromBeginning = false } = {}) {
++    const session = this._sessionFor(browsingContext, true);
++    if (session.status === "saving") {
++      throw new Error("the previous recording is still being saved");
++    }
++    const dir = Services.prefs.getStringPref(PREF_DIR, "");
++    if (!dir) {
++      throw new Error(`${PREF_DIR} is not set`);
++    }
++    await IOUtils.makeDirectory(dir, {
++      createAncestors: true,
++      ignoreExisting: true,
++    });
++    session.dir = dir;
++    session.status = "recording";
++    session.startedAt = Date.now();
++    session.stoppedAt = null;
++    session.fromBeginning = !!fromBeginning;
++    session.summaryPath = null;
++    session.progress = 0;
++    session.output = null;
++    session.outputBytes = 0;
++    session.endedByPage = false;
++    session.mergeError = null;
++    session.frozenTracks = null;
++    this._refreshMeta(session);
++    this._setFlag(session, true);
++    if (fromBeginning) {
++      this._seekToStart(session);
++    }
++    this._emit("state-changed", session);
++    return this._stateOf(session);
++  },
++
++  pause(browsingContext) {
++    const session = this._sessionFor(browsingContext, false);
++    if (!session || session.status !== "recording") {
++      return this.getState(browsingContext);
++    }
++    this._setFlag(session, false);
++    session.status = "paused";
++    this._emit("state-changed", session);
++    return this._stateOf(session);
++  },
++
++  resume(browsingContext) {
++    const session = this._sessionFor(browsingContext, false);
++    if (!session || session.status !== "paused") {
++      return this.getState(browsingContext);
++    }
++    this._setFlag(session, true);
++    session.status = "recording";
++    this._emit("state-changed", session);
++    return this._stateOf(session);
++  },
++
++  /**
++   * Stops the recording and merges its parts into one file. Returns as soon
++   * as the merge has started; "state-changed" reports the progress and the
++   * final "ready", "partial" or "error" status.
++   */
++  async stop(browsingContext) {
++    const session = this._sessionFor(browsingContext, false);
++    if (
++      !session ||
++      (session.status !== "recording" && session.status !== "paused")
++    ) {
++      return this.getState(browsingContext);
++    }
++    this._setFlag(session, false);
++    session.status = "saving";
++    session.stoppedAt = Date.now();
++    session.progress = 0;
++    // What was captured is fixed now; later reports belong to the next one.
++    session.frozenTracks = new Map(session.tracks);
++    await this._writeSummary(session, this._stateOf(session));
++    this._emit("state-changed", session);
++    this._merge(session).catch(e => {
++      console.error("TermuxMediaRecording: merge failed", e);
++      this._finishMerge(session, { error: String(e?.message || e) });
++    });
++    return this._stateOf(session);
++  },
++
++  /**
++   * Called by TermuxMediaRecordingParent for every report from a content
++   * process.
++   */
++  onContentState(actor, rawData) {
++    const data = sanitizeReport(rawData);
++    const browsingContext = actor.browsingContext;
++    if (!data || !browsingContext) {
++      return;
++    }
++    const top = browsingContext.top;
++    const innerWindowId = actor.manager?.innerWindowId ?? 0;
++    const key = `${innerWindowId}:${data.id}`;
++
++    if (data.state === "ended") {
++      const session = this._sessions.get(top.id);
++      if (!session) {
++        return;
++      }
++      session.tracks.delete(key);
++      session.actors.delete(actor);
++      if (session.tracks.size === 0) {
++        if (session.status === "recording" || session.status === "paused") {
++          // The page went away mid-recording: keep what was captured.
++          session.endedByPage = true;
++          this.stop(top).catch(console.error);
++        } else if (session.status === "idle" || session.status === "error") {
++          this._sessions.delete(top.id);
++        }
++      }
++      this._emit("state-changed", session);
++      return;
++    }
++
++    let session = this._sessions.get(top.id);
++    const finished =
++      session &&
++      (session.status === "ready" ||
++        session.status === "partial" ||
++        (session.status === "error" && session.output !== null));
++    if (!session) {
++      session = new Session(top);
++      this._sessions.set(top.id, session);
++    } else if (session.tracks.size === 0 && finished) {
++      // A new video after a finished recording in the same tab: start clean,
++      // the finished one lives on in the history.
++      const fresh = new Session(top);
++      fresh.actors = session.actors;
++      session = fresh;
++      this._sessions.set(top.id, session);
++    }
++    session.actors.add(actor);
++    const isNew = !session.tracks.has(key);
++    session.tracks.set(key, { ...data, key, updatedAt: Date.now() });
++    this._refreshMeta(session);
++    if (data.state === "error" && session.status === "recording") {
++      session.status = "error";
++    }
++    if (isNew) {
++      this._emit("stream-detected", session);
++    }
++    this._emit("state-changed", session);
++  },
++
++  _sessionFor(browsingContext, create) {
++    if (!browsingContext) {
++      return null;
++    }
++    const top = browsingContext.top;
++    let session = this._sessions.get(top.id);
++    if (!session && create) {
++      session = new Session(top);
++      this._sessions.set(top.id, session);
++    }
++    return session || null;
++  },
++
++  _setFlag(session, value) {
++    try {
++      if (!session.browsingContext.isDiscarded) {
++        session.browsingContext.termuxMediaRecording = value;
++      }
++    } catch (e) {
++      console.error("TermuxMediaRecording: cannot set the flag", e);
++    }
++  },
++
++  _seekToStart(session) {
++    for (const actor of session.actors) {
++      try {
++        actor.sendAsyncMessage("TermuxMediaRecording:SeekToStart");
++      } catch (e) {
++        // The window is gone; its tracks will report "ended".
++      }
++    }
++  },
++
++  _refreshMeta(session) {
++    try {
++      const wgp = session.browsingContext.currentWindowGlobal;
++      if (wgp) {
++        session.title = wgp.documentTitle || session.title;
++        session.url = wgp.documentURI?.spec || session.url;
++        try {
++          session.origin = wgp.documentURI?.host || session.origin;
++        } catch (e) {
++          // about:, blob: and friends have no host.
++        }
++      }
++    } catch (e) {
++      // Discarded context; keep what we had.
++    }
++    if (!session.title) {
++      for (const track of session.tracks.values()) {
++        if (track.title) {
++          session.title = track.title;
++          session.url = session.url || track.url || "";
++          break;
++        }
++      }
++    }
++  },
++
++  _stateOf(session) {
++    const tracks = [];
++    let bytes = 0;
++    let parts = 0;
++    let capturedMs = 0;
++    let encrypted = false;
++    let noDir = false;
++    let writeError = false;
++    const files = [];
++    const source = session.frozenTracks || session.tracks;
++    for (const t of source.values()) {
++      const trackFileList = trackFiles(t);
++      files.push(...trackFileList);
++      bytes += t.bytes || 0;
++      parts += t.parts || 0;
++      if (t.startUs >= 0 && t.endUs > t.startUs) {
++        capturedMs = Math.max(capturedMs, (t.endUs - t.startUs) / 1000);
++      }
++      encrypted = encrypted || !!t.encrypted;
++      noDir = noDir || !!t.noDir;
++      writeError = writeError || !!t.writeError;
++      tracks.push({
++        id: t.key,
++        kind: t.kind,
++        mime: t.mime,
++        codec: t.codec,
++        width: t.width,
++        height: t.height,
++        rate: t.rate,
++        channels: t.channels,
++        encrypted: !!t.encrypted,
++        state: t.state,
++        bytes: t.bytes || 0,
++        parts: t.parts || 0,
++        startUs: t.startUs,
++        endUs: t.endUs,
++        files: trackFileList,
++      });
++    }
++    let error = session.mergeError;
++    if (noDir) {
++      error = `${PREF_DIR} is not set`;
++    } else if (writeError) {
++      error = "could not write to the recording directory";
++    }
++    return {
++      browsingContext: session.browsingContext,
++      browsingContextId: session.browsingContextId,
++      status: session.status,
++      title: session.title,
++      url: session.url,
++      origin: session.origin,
++      startedAt: session.startedAt,
++      stoppedAt: session.stoppedAt,
++      fromBeginning: session.fromBeginning,
++      endedByPage: session.endedByPage,
++      dir: session.dir,
++      encrypted,
++      error,
++      bytes,
++      parts,
++      capturedMs: Math.round(capturedMs),
++      tracks,
++      files,
++      progress: session.progress,
++      output: session.output,
++      outputBytes: session.outputBytes,
++      summaryPath: session.summaryPath,
++    };
++  },
++
++  _prefixOf(session) {
++    const source = session.frozenTracks || session.tracks;
++    for (const t of source.values()) {
++      if (t.base) {
++        return t.base.replace(/-(video|audio)-\d+$/, "");
++      }
++    }
++    return `recording-${session.startedAt || Date.now()}`;
++  },
++
++  async _writeSummary(session, summary) {
++    if (!session.dir) {
++      return;
++    }
++    const path = `${session.dir}/${this._prefixOf(session)}.json`;
++    const { browsingContext, ...plain } = summary;
++    try {
++      await IOUtils.writeJSON(path, plain);
++      session.summaryPath = path;
++    } catch (e) {
++      console.error("TermuxMediaRecording: cannot write the summary", e);
++    }
++  },
++
++  /**
++   * Merge: each track's parts are concatenated (stream copy), then video and
++   * audio are muxed into <dir>/<prefix>.mp4 (or .webm). Progress comes from
++   * ffmpeg's -progress output.
++   */
++  async _merge(session) {
++    const state = this._stateOf(session);
++    const byKind = new Map();
++    let webm = false;
++    for (const track of state.tracks) {
++      if (!track.files.length) {
++        continue;
++      }
++      if (!byKind.has(track.kind)) {
++        byKind.set(track.kind, {
++          files: [],
++          durationMs: 0,
++          startUs: Infinity,
++        });
++      }
++      const entry = byKind.get(track.kind);
++      entry.files.push(...track.files);
++      if (track.startUs >= 0 && track.endUs > track.startUs) {
++        entry.durationMs = Math.max(
++          entry.durationMs,
++          (track.endUs - track.startUs) / 1000
++        );
++        entry.startUs = Math.min(entry.startUs, track.startUs);
++      }
++      if (track.files.some(f => f.endsWith(".webm"))) {
++        webm = true;
++      }
++    }
++    if (!byKind.size) {
++      this._finishMerge(session, { error: "nothing was captured" });
++      return;
++    }
++
++    const ffmpeg = await this._ffmpegPath();
++    if (!ffmpeg) {
++      this._finishMerge(session, {
++        error: "ffmpeg was not found (pkg install ffmpeg); the parts are kept",
++      });
++      return;
++    }
++
++    const prefix = `${session.dir}/${this._prefixOf(session)}`;
++    const outExt = webm ? "webm" : "mp4";
++    const output = `${prefix}.${outExt}`;
++    const temporaries = [];
++    const inputs = [];
++    const steps = [...byKind.values()].filter(e => e.files.length > 1).length + 1;
++    let done = 0;
++    const report = fraction => {
++      session.progress = Math.min(0.99, (done + fraction) / steps);
++      this._emit("state-changed", session);
++    };
++
++    // 1. One file per track.
++    for (const [kind, entry] of byKind) {
++      if (entry.files.length === 1) {
++        inputs.push({ path: entry.files[0], kind });
++        continue;
++      }
++      const list = `${prefix}-${kind}.concat.txt`;
++      const merged = `${prefix}-${kind}.merged.${outExt}`;
++      temporaries.push(list, merged);
++      await IOUtils.writeUTF8(
++        list,
++        entry.files
++          .map(f => `file '${f.replace(/'/g, "'\\''")}'\n`)
++          .join("")
++      );
++      await this._runFfmpeg(
++        ffmpeg,
++        ["-f", "concat", "-safe", "0", "-i", list, "-c", "copy", merged],
++        entry.durationMs,
++        report
++      );
++      done++;
++      inputs.push({ path: merged, kind });
++    }
++
++    // 2. Mux them together, keeping the tracks' relative start. ffmpeg
++    // rebases every input to zero, and the video and audio buffers rarely
++    // begin at the same instant (YouTube: seconds apart), so each input is
++    // shifted by its start relative to the earliest one. ffprobe reads the
++    // real file start; the parser's segment times are the fallback.
++    const starts = [];
++    for (const input of inputs) {
++      let start = await this._probeStart(ffmpeg, input.path);
++      if (start === null) {
++        const entry = byKind.get(input.kind);
++        start = Number.isFinite(entry.startUs) ? entry.startUs / 1e6 : null;
++      }
++      starts.push(start);
++    }
++    const earliest = starts.every(s => s !== null) ? Math.min(...starts) : null;
++    const args = [];
++    inputs.forEach((input, i) => {
++      const offset = earliest === null ? 0 : starts[i] - earliest;
++      if (offset > 0.001) {
++        args.push("-itsoffset", offset.toFixed(6));
++      }
++      args.push("-i", input.path);
++    });
++    args.push("-c", "copy");
++    if (!webm) {
++      args.push("-movflags", "+faststart");
++    }
++    args.push(output);
++    await this._runFfmpeg(ffmpeg, args, state.capturedMs, report);
++
++    // 3. Tidy up.
++    const keepParts = Services.prefs.getBoolPref(PREF_KEEP_PARTS, false);
++    const toRemove = [...temporaries];
++    if (!keepParts) {
++      toRemove.push(...state.files);
++    }
++    for (const f of toRemove) {
++      await IOUtils.remove(f, { ignoreAbsent: true }).catch(() => {});
++    }
++    let outputBytes = 0;
++    try {
++      outputBytes = (await IOUtils.stat(output)).size;
++    } catch (e) {
++      // Reported without a size.
++    }
++    this._finishMerge(session, { output, outputBytes });
++  },
++
++  async _finishMerge(session, { output = null, outputBytes = 0, error = null }) {
++    if (session.status !== "saving") {
++      return;
++    }
++    session.progress = error ? session.progress : 1;
++    session.output = output;
++    session.outputBytes = outputBytes;
++    session.mergeError = error;
++    if (error) {
++      session.status = "error";
++    } else {
++      session.status = session.endedByPage ? "partial" : "ready";
++    }
++    const summary = this._stateOf(session);
++    this._history.push(summary);
++    await this._writeSummary(session, summary);
++    this._emit("state-changed", session);
++  },
++
++  /**
++   * The start time of a media file in seconds via ffprobe (next to ffmpeg),
++   * or null when it cannot be determined.
++   */
++  async _probeStart(ffmpeg, file) {
++    const ffprobe = ffmpeg.replace(/ffmpeg([^/]*)$/, "ffprobe$1");
++    if (ffprobe === ffmpeg || !(await IOUtils.exists(ffprobe))) {
++      return null;
++    }
++    try {
++      const proc = await lazy.Subprocess.call({
++        command: ffprobe,
++        arguments: [
++          "-v",
++          "error",
++          "-show_entries",
++          "format=start_time",
++          "-of",
++          "default=noprint_wrappers=1:nokey=1",
++          file,
++        ],
++      });
++      let out = "";
++      for (;;) {
++        const chunk = await proc.stdout.readString();
++        if (!chunk) {
++          break;
++        }
++        out += chunk;
++      }
++      const { exitCode } = await proc.wait();
++      const start = parseFloat(out);
++      return exitCode === 0 && Number.isFinite(start) ? start : null;
++    } catch (e) {
++      return null;
++    }
++  },
++
++  async _ffmpegPath() {
++    const configured = Services.prefs.getStringPref(PREF_FFMPEG, "");
++    if (configured && (await IOUtils.exists(configured))) {
++      return configured;
++    }
++    try {
++      return await lazy.Subprocess.pathSearch("ffmpeg");
++    } catch (e) {
++      return null;
++    }
++  },
++
++  async _runFfmpeg(ffmpeg, args, durationMs, report) {
++    const proc = await lazy.Subprocess.call({
++      command: ffmpeg,
++      arguments: [
++        "-nostdin",
++        "-hide_banner",
++        "-loglevel",
++        "error",
++        "-nostats",
++        "-progress",
++        "pipe:1",
++        "-y",
++        ...args,
++      ],
++      stderr: "stdout",
++    });
++    const logTail = [];
++    let buffer = "";
++    const handleLine = line => {
++      const match = /^out_time_(us|ms)=(\d+)/.exec(line);
++      if (match) {
++        // Both keys are microseconds in practice.
++        if (durationMs > 0) {
++          report(Math.min(1, Number(match[2]) / 1000 / durationMs));
++        }
++        return;
++      }
++      if (/^(frame|fps|bitrate|total_size|speed|progress|stream_|dup_|drop_)/.test(line)) {
++        return;
++      }
++      if (line.trim()) {
++        logTail.push(line.trim());
++        if (logTail.length > 12) {
++          logTail.shift();
++        }
++      }
++    };
++    for (;;) {
++      const chunk = await proc.stdout.readString();
++      if (!chunk) {
++        break;
++      }
++      buffer += chunk;
++      let index;
++      while ((index = buffer.indexOf("\n")) >= 0) {
++        handleLine(buffer.slice(0, index));
++        buffer = buffer.slice(index + 1);
++      }
++    }
++    if (buffer) {
++      handleLine(buffer);
++    }
++    const { exitCode } = await proc.wait();
++    if (exitCode !== 0) {
++      throw new Error(
++        `ffmpeg exited with ${exitCode}: ${logTail.join(" | ") || "no output"}`
++      );
++    }
++  },
++};
+--- a/toolkit/components/moz.build
++++ b/toolkit/components/moz.build
+@@ -83,6 +83,7 @@
+     "startup",
+     "statusfilter",
+     "telemetry",
++    "termux",
+     "translations",
+     "thumbnails",
+     "timermanager",
+--- /dev/null
++++ b/toolkit/actors/TermuxMediaRecordingChild.sys.mjs
+@@ -0,0 +1,48 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++/**
++ * Termux media recording (yamsergey.termux.packages patch 0035).
++ *
++ * Forwards the "termux-media-recording" observer notifications that
++ * SourceBuffer fires (patch 0034; subject: the window, data: JSON) to the
++ * parent, and rewinds the page's MSE media elements on request.
++ */
++export class TermuxMediaRecordingChild extends JSWindowActorChild {
++  observe(subject, topic, data) {
++    if (topic !== "termux-media-recording") {
++      return;
++    }
++    let payload;
++    try {
++      payload = JSON.parse(data);
++    } catch (e) {
++      return;
++    }
++    const doc = this.document;
++    payload.title = doc?.title || "";
++    payload.url = doc?.location?.href || "";
++    this.sendAsyncMessage("TermuxMediaRecording:State", payload);
++  }
++
++  receiveMessage(message) {
++    if (message.name !== "TermuxMediaRecording:SeekToStart") {
++      return;
++    }
++    const doc = this.document;
++    if (!doc) {
++      return;
++    }
++    for (const element of doc.querySelectorAll("video, audio")) {
++      try {
++        const src = element.currentSrc || element.src || "";
++        if (element.srcObject || src.startsWith("blob:")) {
++          element.currentTime = 0;
++        }
++      } catch (e) {
++        // Not seekable right now; the recording simply starts from here.
++      }
++    }
++  }
++}
+--- /dev/null
++++ b/toolkit/actors/TermuxMediaRecordingParent.sys.mjs
+@@ -0,0 +1,22 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++/**
++ * Termux media recording (yamsergey.termux.packages patch 0035).
++ */
++
++const lazy = {};
++
++ChromeUtils.defineESModuleGetters(lazy, {
++  TermuxMediaRecording:
++    "moz-src:///toolkit/components/termux/TermuxMediaRecording.sys.mjs",
++});
++
++export class TermuxMediaRecordingParent extends JSWindowActorParent {
++  receiveMessage(message) {
++    if (message.name === "TermuxMediaRecording:State") {
++      lazy.TermuxMediaRecording.onContentState(this, message.data);
++    }
++  }
++}
+--- a/toolkit/actors/moz.build
++++ b/toolkit/actors/moz.build
+@@ -69,6 +69,8 @@
+     "RemotePageChild.sys.mjs",
+     "SelectChild.sys.mjs",
+     "SelectParent.sys.mjs",
++    "TermuxMediaRecordingChild.sys.mjs",
++    "TermuxMediaRecordingParent.sys.mjs",
+     "ThumbnailsChild.sys.mjs",
+     "TLSCertificateBindingChild.sys.mjs",
+     "UAWidgetsChild.sys.mjs",
+--- a/toolkit/modules/ActorManagerParent.sys.mjs
++++ b/toolkit/modules/ActorManagerParent.sys.mjs
+@@ -613,6 +613,25 @@
+     safeForUntrustedWebProcess: true,
+   },
+ 
++  // Termux media recording (yamsergey.termux.packages patch 0035).
++  TermuxMediaRecording: {
++    parent: {
++      esModuleURI:
++        "moz-src:///toolkit/actors/TermuxMediaRecordingParent.sys.mjs",
++    },
++
++    child: {
++      esModuleURI:
++        "moz-src:///toolkit/actors/TermuxMediaRecordingChild.sys.mjs",
++      observers: ["termux-media-recording"],
++    },
++
++    allFrames: true,
++    // The child side lives in web content processes (Firefox 156 refuses to
++    // create the actor there otherwise); the parent sanitizes every report.
++    safeForUntrustedWebProcess: true,
++  },
++
+   Thumbnails: {
+     child: {
+       esModuleURI: "moz-src:///toolkit/actors/ThumbnailsChild.sys.mjs",
