@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/remote/webdriver-bidi/modules/root/termux.sys.mjs
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,224 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -86,7 +86,7 @@
 +        break;
 +    }
 +
-+    return this.#serialize(lazy.TermuxMediaRecording.getState(top));
++    return this.#serialize(lazy.TermuxMediaRecording.getState(top), contextId);
 +  }
 +
 +  getMediaRecordingState(options = {}) {
@@ -98,7 +98,10 @@
 +    );
 +
 +    const context = this._getNavigable(contextId);
-+    return this.#serialize(lazy.TermuxMediaRecording.getState(context.top));
++    return this.#serialize(
++      lazy.TermuxMediaRecording.getState(context.top),
++      contextId
++    );
 +  }
 +
 +  listRecordings() {
@@ -109,9 +112,20 @@
 +    };
 +  }
 +
-+  #serialize(state) {
++  #serialize(state, contextId = null) {
 +    if (!state) {
-+      return null;
++      // No media seen in that tab yet and nothing started.
++      return {
++        context: contextId,
++        status: "idle",
++        tracks: [],
++        files: [],
++        bytes: 0,
++        parts: 0,
++        capturedMs: 0,
++        encrypted: false,
++        error: null,
++      };
 +    }
 +    const { browsingContext, ...rest } = state;
 +    let context = null;

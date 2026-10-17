@@ -417,7 +417,7 @@
    StartUpdating();
  
    mTrackBuffersManager->AppendData(aData.forget(), mCurrentAttributes)
-@@ -644,11 +657,202 @@
+@@ -644,11 +657,208 @@
  
    CheckEndTime();
  
@@ -608,13 +608,19 @@
 +  AppendJSONString(json, mDumpExt);
 +  json.Append('}');
 +
-+  nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
-+  if (!obs) {
-+    return;
-+  }
-+  nsCOMPtr<nsISupports> subject = do_QueryInterface(window);
-+  obs->NotifyObservers(subject, "termux-media-recording",
-+                       NS_ConvertUTF8toUTF16(json).get());
++  // Asynchronously: Detach() runs during media element teardown, at times
++  // when script is blocked, and the observer is a JSWindowActor.
++  nsCOMPtr<nsPIDOMWindowInner> win = window;
++  nsString data = NS_ConvertUTF8toUTF16(json);
++  NS_DispatchToMainThread(NS_NewRunnableFunction(
++      "SourceBuffer::ReportDumpState", [win, data]() {
++        nsCOMPtr<nsIObserverService> obs = services::GetObserverService();
++        if (!obs) {
++          return;
++        }
++        nsCOMPtr<nsISupports> subject = do_QueryInterface(win);
++        obs->NotifyObservers(subject, "termux-media-recording", data.get());
++      }));
 +}
 +
  void SourceBuffer::AppendDataErrored(const MediaResult& aError) {
