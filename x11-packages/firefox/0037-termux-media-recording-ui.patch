@@ -14,7 +14,7 @@
 +]
 --- /dev/null
 +++ b/browser/components/termux/TermuxRecordingUI.sys.mjs
-@@ -0,0 +1,438 @@
+@@ -0,0 +1,480 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -204,7 +204,8 @@
 +      !!state &&
 +      (state.tracks.length > 0 ||
 +        state.status === "recording" ||
-+        state.status === "paused");
++        state.status === "paused" ||
++        state.status === "saving");
 +    entry.node.hidden = !show;
 +    let icon = ICON_IDLE;
 +    let tooltip = "Record media on this page";
@@ -214,6 +215,8 @@
 +    } else if (state?.status === "paused") {
 +      icon = ICON_PAUSED;
 +      tooltip = "Recording paused";
++    } else if (state?.status === "saving") {
++      tooltip = `Saving recording · ${Math.round(state.progress * 100)}%`;
 +    }
 +    entry.node.setAttribute("image", icon);
 +    entry.node.setAttribute("tooltiptext", tooltip);
@@ -296,9 +299,14 @@
 +    } else if (status === "paused") {
 +      title = "Recording paused";
 +      subtitle = state.origin || "";
-+    } else if (status === "stopped") {
-+      title = "Recording saved";
-+      subtitle = `${state.files.length} file${state.files.length === 1 ? "" : "s"} in ${state.dir}`;
++    } else if (status === "saving") {
++      title = "Saving recording";
++      subtitle = `Merging ${state.parts} part${state.parts === 1 ? "" : "s"} into one file`;
++    } else if (status === "ready" || status === "partial") {
++      title = status === "ready" ? "Recording saved" : "Recording saved (the page closed early)";
++      subtitle = state.output
++        ? `${state.output}${state.outputBytes ? ` · ${formatBytes(state.outputBytes)}` : ""}`
++        : state.dir;
 +    } else if (status === "error") {
 +      title = "Recording failed";
 +      subtitle = state.error || "Unknown error";
@@ -313,6 +321,23 @@
 +    );
 +    header.appendChild(this._el(doc, "span", muted, subtitle));
 +    content.appendChild(header);
++
++    // Merge progress
++    if (state && status === "saving") {
++      const bar = this._el(
++        doc,
++        "div",
++        "height: 6px; border-radius: 3px; overflow: hidden; background: color-mix(in srgb, currentColor 12%, transparent);"
++      );
++      bar.appendChild(
++        this._el(
++          doc,
++          "div",
++          `height: 6px; width: ${Math.round(state.progress * 100)}%; background: #0060df; border-radius: 3px;`
++        )
++      );
++      content.appendChild(bar);
++    }
 +
 +    // Live stats
 +    if (state && (status === "recording" || status === "paused")) {
@@ -381,9 +406,14 @@
 +      );
 +    }
 +
-+    // Options and footer for the idle / stopped states
++    // Options and footer for the idle and finished states
++    const idleLike =
++      status === "idle" ||
++      status === "ready" ||
++      status === "partial" ||
++      status === "error";
 +    let fromStart = null;
-+    if (!state?.encrypted && (status === "idle" || status === "stopped")) {
++    if (!state?.encrypted && idleLike) {
 +      const option = row();
 +      option.style.alignItems = "flex-start";
 +      fromStart = this._el(doc, "input", "margin: 2px 0 0; width: 16px; height: 16px;");
@@ -410,6 +440,14 @@
 +      content.appendChild(
 +        this._el(doc, "span", muted, "Keeps recording while you browse other tabs. Closing this tab stops and saves what was captured.")
 +      );
++    } else if (status === "saving") {
++      content.appendChild(
++        this._el(doc, "span", muted, "The parts are kept until the merge finishes, so nothing is lost if Firefox closes.")
++      );
++    } else if (status === "error" && state?.files.length) {
++      content.appendChild(
++        this._el(doc, "span", muted, `The ${state.files.length} recorded part${state.files.length === 1 ? " is" : "s are"} kept in ${state.dir}.`)
++      );
 +    }
 +
 +    // Buttons
@@ -420,7 +458,9 @@
 +    );
 +    const close = () => panel.hidePopup();
 +    const recorder = lazy.TermuxMediaRecording;
-+    if (state?.encrypted && status !== "recording" && status !== "paused") {
++    if (status === "saving") {
++      buttons.appendChild(this._button(doc, "Close", true, close));
++    } else if (state?.encrypted && status !== "recording" && status !== "paused") {
 +      buttons.appendChild(this._button(doc, "Close", true, close));
 +    } else if (status === "recording") {
 +      buttons.appendChild(
@@ -441,9 +481,11 @@
 +        this._button(doc, "Resume", true, () => recorder.resume(browsingContext))
 +      );
 +    } else {
-+      buttons.appendChild(this._button(doc, "Cancel", false, close));
 +      buttons.appendChild(
-+        this._button(doc, "Start recording", true, () => {
++        this._button(doc, status === "idle" ? "Cancel" : "Close", false, close)
++      );
++      buttons.appendChild(
++        this._button(doc, status === "idle" ? "Start recording" : "Record again", true, () => {
 +          recorder
 +            .start(browsingContext, { fromBeginning: !!fromStart?.checked })
 +            .catch(console.error);

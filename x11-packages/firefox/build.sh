@@ -138,7 +138,6 @@ termux_step_make_install() {
 	install -Dm644 -t "${TERMUX_PREFIX}/lib/firefox/defaults/pref" "${TERMUX_PKG_BUILDER_DIR}/termux-assistant.js"
 	# Per-tab recording of streamed (MSE) media to disk (patches 0034-0037).
 	install -Dm644 -t "${TERMUX_PREFIX}/lib/firefox/defaults/pref" "${TERMUX_PKG_BUILDER_DIR}/termux-recording.js"
-	install -Dm755 -t "${TERMUX_PREFIX}/bin" "${TERMUX_PKG_BUILDER_DIR}/termux-firefox-recording-merge"
 
 	# Install icons as Arch Linux does
 	local i theme=official
