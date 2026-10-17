@@ -14,7 +14,7 @@
 +]
 --- /dev/null
 +++ b/toolkit/components/termux/TermuxMediaRecording.sys.mjs
-@@ -0,0 +1,762 @@
+@@ -0,0 +1,843 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -567,7 +567,6 @@
 +    const outExt = webm ? "webm" : "mp4";
 +    const output = `${prefix}.${outExt}`;
 +    const temporaries = [];
-+    const inputs = [];
 +    const steps = [...byKind.values()].filter(e => e.files.length > 1).length + 1;
 +    let done = 0;
 +    const report = fraction => {
@@ -575,45 +574,79 @@
 +      this._emit("state-changed", session);
 +    };
 +
-+    // 1. One file per track.
++    // 1. Measure every part: where it starts in the stream's timeline
++    //    (ffprobe) and how much media it really holds (a stream-copy pass to
++    //    the null muxer). The header cannot be trusted for the length: a live
++    //    stream's init segment may claim hours.
++    const tracks = [];
 +    for (const [kind, entry] of byKind) {
-+      if (entry.files.length === 1) {
-+        inputs.push({ path: entry.files[0], kind });
++      const parts = [];
++      for (const file of entry.files) {
++        parts.push({
++          file,
++          start: await this._probeStart(ffmpeg, file),
++          span: await this._measureSpan(ffmpeg, file),
++        });
++      }
++      let start = parts[0].start;
++      if (start === null && Number.isFinite(entry.startUs)) {
++        start = entry.startUs / 1e6;
++      }
++      tracks.push({ kind, entry, parts, start });
++    }
++
++    // 2. One file per track. Parts are contiguous runs of media time in
++    //    append order (the dump cuts a new one at every seek, rendition
++    //    change or live discontinuity), so each one is placed right after
++    //    the previous one, trimmed where the next part starts inside it.
++    const inputs = [];
++    for (const track of tracks) {
++      const { kind, entry, parts } = track;
++      if (parts.length === 1) {
++        inputs.push({ path: parts[0].file, kind, start: track.start });
 +        continue;
 +      }
 +      const list = `${prefix}-${kind}.concat.txt`;
 +      const merged = `${prefix}-${kind}.merged.${outExt}`;
 +      temporaries.push(list, merged);
-+      await IOUtils.writeUTF8(
-+        list,
-+        entry.files
-+          .map(f => `file '${f.replace(/'/g, "'\\''")}'\n`)
-+          .join("")
-+      );
++      const lines = [];
++      let totalMs = 0;
++      parts.forEach((part, i) => {
++        lines.push(`file '${part.file.replace(/'/g, "'\\''")}'`);
++        let span = part.span;
++        const next = parts[i + 1];
++        if (
++          span !== null &&
++          next &&
++          part.start !== null &&
++          next.start !== null &&
++          next.start > part.start &&
++          next.start < part.start + span
++        ) {
++          span = next.start - part.start;
++          lines.push(`outpoint ${(part.start + span).toFixed(6)}`);
++        }
++        if (span !== null) {
++          lines.push(`duration ${span.toFixed(6)}`);
++          totalMs += span * 1000;
++        }
++      });
++      await IOUtils.writeUTF8(list, lines.join("\n") + "\n");
 +      await this._runFfmpeg(
 +        ffmpeg,
 +        ["-f", "concat", "-safe", "0", "-i", list, "-c", "copy", merged],
-+        entry.durationMs,
++        totalMs || entry.durationMs,
 +        report
 +      );
 +      done++;
-+      inputs.push({ path: merged, kind });
++      inputs.push({ path: merged, kind, start: track.start });
 +    }
 +
-+    // 2. Mux them together, keeping the tracks' relative start. ffmpeg
++    // 3. Mux them together, keeping the tracks' relative start. ffmpeg
 +    // rebases every input to zero, and the video and audio buffers rarely
 +    // begin at the same instant (YouTube: seconds apart), so each input is
-+    // shifted by its start relative to the earliest one. ffprobe reads the
-+    // real file start; the parser's segment times are the fallback.
-+    const starts = [];
-+    for (const input of inputs) {
-+      let start = await this._probeStart(ffmpeg, input.path);
-+      if (start === null) {
-+        const entry = byKind.get(input.kind);
-+        start = Number.isFinite(entry.startUs) ? entry.startUs / 1e6 : null;
-+      }
-+      starts.push(start);
-+    }
++    // shifted by its start relative to the earliest one.
++    const starts = inputs.map(input => input.start);
 +    const earliest = starts.every(s => s !== null) ? Math.min(...starts) : null;
 +    const args = [];
 +    inputs.forEach((input, i) => {
@@ -630,7 +663,7 @@
 +    args.push(output);
 +    await this._runFfmpeg(ffmpeg, args, state.capturedMs, report);
 +
-+    // 3. Tidy up.
++    // 4. Tidy up.
 +    const keepParts = Services.prefs.getBoolPref(PREF_KEEP_PARTS, false);
 +    const toRemove = [...temporaries];
 +    if (!keepParts) {
@@ -665,6 +698,54 @@
 +    this._history.push(summary);
 +    await this._writeSummary(session, summary);
 +    this._emit("state-changed", session);
++  },
++
++  /**
++   * How many seconds of media a file really holds: a stream copy to the null
++   * muxer, reading ffmpeg's last out_time. null when it cannot be measured.
++   */
++  async _measureSpan(ffmpeg, file) {
++    try {
++      const proc = await lazy.Subprocess.call({
++        command: ffmpeg,
++        arguments: [
++          "-nostdin",
++          "-hide_banner",
++          "-loglevel",
++          "error",
++          "-nostats",
++          "-progress",
++          "pipe:1",
++          "-i",
++          file,
++          "-c",
++          "copy",
++          "-f",
++          "null",
++          "-",
++        ],
++        stderr: "stdout",
++      });
++      let out = "";
++      for (;;) {
++        const chunk = await proc.stdout.readString();
++        if (!chunk) {
++          break;
++        }
++        out += chunk;
++        if (out.length > 1 << 20) {
++          out = out.slice(-65536);
++        }
++      }
++      const { exitCode } = await proc.wait();
++      let last = null;
++      for (const match of out.matchAll(/^out_time_(?:us|ms)=(\d+)$/gm)) {
++        last = Number(match[1]) / 1e6;
++      }
++      return exitCode === 0 && last !== null && last > 0 ? last : null;
++    } catch (e) {
++      return null;
++    }
 +  },
 +
 +  /**
