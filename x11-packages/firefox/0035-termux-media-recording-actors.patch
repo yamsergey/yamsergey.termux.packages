@@ -14,7 +14,7 @@
 +]
 --- /dev/null
 +++ b/toolkit/components/termux/TermuxMediaRecording.sys.mjs
-@@ -0,0 +1,864 @@
+@@ -0,0 +1,1050 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -44,6 +44,8 @@
 +const PREF_DIR = "media.termux.recording.dir";
 +const PREF_FFMPEG = "media.termux.recording.ffmpeg";
 +const PREF_KEEP_PARTS = "media.termux.recording.keepParts";
++// Rescale H.264 parts of another size than the main rendition in the merge.
++const PREF_RESCALE = "media.termux.recording.rescaleParts";
 +
 +class Listeners {
 +  #fns = new Set();
@@ -111,6 +113,67 @@
 +  return files;
 +}
 +
++/**
++ * Puts the measured parts of one kind in media order and leaves out those
++ * that only repeat media covered already: a page may stream one program
++ * through two players (a site's mini player next to the main one), each with
++ * its own buffer, and the dump cuts a part at every seek, rendition change
++ * or discontinuity. Parts without a readable start keep their append order
++ * at the end. Also picks the main rendition (the size with the most media)
++ * and lists the H.264 parts of another size, to be rescaled to it.
++ */
++function planParts(parts) {
++  const timed = parts
++    .filter(p => p.start !== null)
++    .sort((a, b) => a.start - b.start || a.order - b.order);
++  const untimed = parts.filter(p => p.start === null);
++  const kept = [];
++  const contained = [];
++  let coveredEnd = -Infinity;
++  for (const part of timed) {
++    const end = part.start + part.span;
++    if (end <= coveredEnd + 0.1) {
++      contained.push(part);
++      continue;
++    }
++    kept.push(part);
++    coveredEnd = Math.max(coveredEnd, end);
++  }
++  const ordered = [...kept, ...untimed];
++  const bySize = new Map();
++  for (const p of ordered) {
++    if (p.width && p.height) {
++      const key = `${p.width}x${p.height}`;
++      bySize.set(key, (bySize.get(key) || 0) + p.span);
++    }
++  }
++  let main = null;
++  for (const [key, total] of bySize) {
++    if (!main || total > main.total) {
++      const [width, height] = key.split("x").map(Number);
++      main = { width, height, total, codec: "", profile: "", timescale: 0 };
++    }
++  }
++  let rescale = [];
++  if (main) {
++    const sample = ordered.find(
++      p => p.width === main.width && p.height === main.height
++    );
++    main.codec = sample.codec;
++    main.profile = sample.profile;
++    main.timescale = sample.timescale;
++    rescale = ordered.filter(
++      p =>
++        p.width &&
++        p.height &&
++        (p.width !== main.width || p.height !== main.height) &&
++        p.codec === "h264" &&
++        main.codec === "h264"
++    );
++  }
++  return { parts: ordered, contained, main, rescale };
++}
++
 +const REPORT_STATES = new Set(["idle", "recording", "error", "ended"]);
 +// What SourceBuffer::UpdateDumpState generates: <time>-<host>-<kind>-<id>.
 +const BASE_NAME = /^\d{1,20}-[A-Za-z0-9._-]{1,200}-(video|audio)-\d{1,10}$/;
@@ -159,6 +222,9 @@
 +    startUs: int(raw.startUs, -1),
 +    endUs: int(raw.endUs, -1),
 +    recordedUs: Math.max(0, int(raw.recordedUs)),
++    skippedSegments: Math.max(0, int(raw.skippedSegments)),
++    keyframeWaits: Math.max(0, int(raw.keyframeWaits)),
++    emptySegments: Math.max(0, int(raw.emptySegments)),
 +    dir: hasFiles ? dir : "",
 +    base: hasFiles ? base : "",
 +    ext: hasFiles ? ext : "",
@@ -235,6 +301,9 @@
 +          startUs: -1,
 +          endUs: -1,
 +          recordedUs: 0,
++          skippedSegments: 0,
++          keyframeWaits: 0,
++          emptySegments: 0,
 +          dir: "",
 +          base: "",
 +          ext: "",
@@ -467,6 +536,12 @@
 +        startUs: t.startUs,
 +        endUs: t.endUs,
 +        recordedUs: t.recordedUs || 0,
++        // Dump decisions, for diagnosis: segments left out as already
++        // recorded, dropped while waiting for a keyframe to start a part,
++        // and dropped for a zero-size sample.
++        skippedSegments: t.skippedSegments || 0,
++        keyframeWaits: t.keyframeWaits || 0,
++        emptySegments: t.emptySegments || 0,
 +        files: trackFileList,
 +      });
 +    }
@@ -526,36 +601,16 @@
 +  },
 +
 +  /**
-+   * Merge: each track's parts are concatenated (stream copy), then video and
-+   * audio are muxed into <dir>/<prefix>.mp4 (or .webm). Progress comes from
-+   * ffmpeg's -progress output.
++   * Merge: the parts of all tracks of a kind go in media order (planParts),
++   * parts of another size than the main rendition are rescaled to it (H.264
++   * only), the result is concatenated (stream copy, overlaps trimmed), and
++   * video and audio are muxed into <dir>/<prefix>.mp4 (or .webm). Progress
++   * comes from ffmpeg's -progress output.
 +   */
 +  async _merge(session) {
 +    const state = this._stateOf(session);
-+    const byKind = new Map();
-+    let webm = false;
-+    for (const track of state.tracks) {
-+      if (!track.files.length) {
-+        continue;
-+      }
-+      if (!byKind.has(track.kind)) {
-+        byKind.set(track.kind, {
-+          files: [],
-+          durationMs: 0,
-+          startUs: Infinity,
-+        });
-+      }
-+      const entry = byKind.get(track.kind);
-+      entry.files.push(...track.files);
-+      entry.durationMs = Math.max(entry.durationMs, track.recordedUs / 1000);
-+      if (track.startUs >= 0) {
-+        entry.startUs = Math.min(entry.startUs, track.startUs);
-+      }
-+      if (track.files.some(f => f.endsWith(".webm"))) {
-+        webm = true;
-+      }
-+    }
-+    if (!byKind.size) {
++    const webm = state.files.some(f => f.endsWith(".webm"));
++    if (!state.files.length) {
 +      this._finishMerge(session, { error: "nothing was captured" });
 +      return;
 +    }
@@ -568,28 +623,24 @@
 +      return;
 +    }
 +
-+    const prefix = `${session.dir}/${this._prefixOf(session)}`;
-+    const outExt = webm ? "webm" : "mp4";
-+    const output = `${prefix}.${outExt}`;
-+    const temporaries = [];
-+    const steps = [...byKind.values()].filter(e => e.files.length > 1).length + 1;
-+    let done = 0;
-+    const report = fraction => {
-+      session.progress = Math.min(0.99, (done + fraction) / steps);
-+      this._emit("state-changed", session);
-+    };
-+
-+    // 1. Measure every part: where it starts in the stream's timeline
-+    //    (ffprobe) and how much media it really holds (a stream-copy pass to
-+    //    the null muxer). The header cannot be trusted for the length: a live
-+    //    stream's init segment may claim hours. A part ffmpeg cannot read
-+    //    (or one without media) would fail the whole concat: it is left out
-+    //    and kept on disk.
-+    const tracks = [];
++    // 1. Measure every part: where it starts in the stream's timeline and
++    //    its picture size (ffprobe), and how much media it really holds (a
++    //    stream-copy pass to the null muxer). The header cannot be trusted
++    //    for the length: a live stream's init segment may claim hours. A part
++    //    ffmpeg cannot read (or one without media) would fail the whole
++    //    concat: it is left out and kept on disk.
++    const byKind = new Map();
++    const startUsByKind = new Map();
 +    const unreadable = [];
-+    for (const [kind, entry] of byKind) {
-+      const parts = [];
-+      for (const file of entry.files) {
++    let order = 0;
++    for (const track of state.tracks) {
++      if (track.startUs >= 0) {
++        startUsByKind.set(
++          track.kind,
++          Math.min(startUsByKind.get(track.kind) ?? Infinity, track.startUs)
++        );
++      }
++      for (const file of track.files) {
 +        if (!(await IOUtils.exists(file))) {
 +          console.warn(`TermuxMediaRecording: ${file} is missing`);
 +          continue;
@@ -600,31 +651,94 @@
 +          unreadable.push(file);
 +          continue;
 +        }
-+        parts.push({ file, start: await this._probeStart(ffmpeg, file), span });
++        const info = await this._probeInfo(ffmpeg, file);
++        if (!byKind.has(track.kind)) {
++          byKind.set(track.kind, []);
++        }
++        byKind.get(track.kind).push({
++          file,
++          span,
++          order: order++,
++          start: info.start,
++          // The timeline of the file in the concat list (a rescaled copy
++          // starts over at zero while `start` stays the stream's time).
++          fileStart: info.start,
++          width: info.width,
++          height: info.height,
++          codec: info.codec,
++          profile: info.profile,
++          timescale: info.timescale,
++        });
 +      }
-+      if (!parts.length) {
-+        continue;
-+      }
-+      let start = parts[0].start;
-+      if (start === null && Number.isFinite(entry.startUs)) {
-+        start = entry.startUs / 1e6;
-+      }
-+      tracks.push({ kind, entry, parts, start });
 +    }
-+    if (!tracks.length) {
++    if (!byKind.size) {
 +      this._finishMerge(session, { error: "nothing was captured" });
 +      return;
 +    }
 +
-+    // 2. One file per track. Parts are contiguous runs of media time in
-+    //    append order (the dump cuts a new one at every seek, rendition
-+    //    change or live discontinuity), so each one is placed right after
-+    //    the previous one, trimmed where the next part starts inside it.
++    const prefix = `${session.dir}/${this._prefixOf(session)}`;
++    const outExt = webm ? "webm" : "mp4";
++    const output = `${prefix}.${outExt}`;
++    const temporaries = [];
++    const plans = new Map();
++    for (const [kind, parts] of byKind) {
++      plans.set(kind, planParts(parts));
++    }
++    const rescale =
++      !webm && Services.prefs.getBoolPref(PREF_RESCALE, true);
++    let steps = 1;
++    for (const [kind, plan] of plans) {
++      steps += plan.parts.length > 1 ? 1 : 0;
++      steps += kind === "video" && rescale ? plan.rescale.length : 0;
++    }
++    let done = 0;
++    const report = fraction => {
++      session.progress = Math.min(0.99, (done + fraction) / steps);
++      this._emit("state-changed", session);
++    };
++
++    // 2. Rescale the parts of another size to the main rendition, so that
++    //    the picture size never changes inside the file (players that do not
++    //    reconfigure their decoder on an in-band change show the small
++    //    picture inside the big one). Only the odd parts are re-encoded; a
++    //    part whose encode fails stays as it is.
++    if (rescale) {
++      const plan = plans.get("video");
++      for (const part of plan?.rescale || []) {
++        const target = `${prefix}-video-${String(part.order).padStart(3, "0")}.rescaled.mp4`;
++        temporaries.push(target);
++        try {
++          await this._rescalePart(ffmpeg, part, plan.main, target, report);
++          const span = await this._measureSpan(ffmpeg, target);
++          if (!span) {
++            throw new Error("the rescaled part has no readable media");
++          }
++          part.file = target;
++          part.span = Math.min(part.span, span);
++          part.fileStart = (await this._probeInfo(ffmpeg, target)).start ?? 0;
++        } catch (e) {
++          console.warn(`TermuxMediaRecording: cannot rescale ${part.file}`, e);
++        }
++        done++;
++      }
++    }
++
++    // 3. One file per kind. Each part is placed right after the previous
++    //    one and cut at its measured end (an audio tail past the last video
++    //    frame would overlap the next part), or where the next part starts
++    //    inside it. outpoint is in the file's own timeline.
 +    const inputs = [];
-+    for (const track of tracks) {
-+      const { kind, entry, parts } = track;
++    for (const [kind, plan] of plans) {
++      const parts = plan.parts;
++      if (!parts.length) {
++        continue;
++      }
++      let start = parts[0].start;
++      if (start === null && startUsByKind.has(kind)) {
++        start = startUsByKind.get(kind) / 1e6;
++      }
 +      if (parts.length === 1) {
-+        inputs.push({ path: parts[0].file, kind, start: track.start });
++        inputs.push({ path: parts[0].file, kind, start });
 +        continue;
 +      }
 +      const list = `${prefix}-${kind}.concat.txt`;
@@ -637,7 +751,6 @@
 +        let span = part.span;
 +        const next = parts[i + 1];
 +        if (
-+          span !== null &&
 +          next &&
 +          part.start !== null &&
 +          next.start !== null &&
@@ -645,25 +758,25 @@
 +          next.start < part.start + span
 +        ) {
 +          span = next.start - part.start;
-+          lines.push(`outpoint ${(part.start + span).toFixed(6)}`);
 +        }
-+        if (span !== null) {
-+          lines.push(`duration ${span.toFixed(6)}`);
-+          totalMs += span * 1000;
++        if (part.fileStart !== null) {
++          lines.push(`outpoint ${(part.fileStart + span).toFixed(6)}`);
 +        }
++        lines.push(`duration ${span.toFixed(6)}`);
++        totalMs += span * 1000;
 +      });
 +      await IOUtils.writeUTF8(list, lines.join("\n") + "\n");
 +      await this._runFfmpeg(
 +        ffmpeg,
 +        ["-f", "concat", "-safe", "0", "-i", list, "-c", "copy", merged],
-+        totalMs || entry.durationMs,
++        totalMs,
 +        report
 +      );
 +      done++;
-+      inputs.push({ path: merged, kind, start: track.start });
++      inputs.push({ path: merged, kind, start });
 +    }
 +
-+    // 3. Mux them together, keeping the tracks' relative start. ffmpeg
++    // 4. Mux them together, keeping the tracks' relative start. ffmpeg
 +    // rebases every input to zero, and the video and audio buffers rarely
 +    // begin at the same instant (YouTube: seconds apart), so each input is
 +    // shifted by its start relative to the earliest one.
@@ -684,7 +797,8 @@
 +    args.push(output);
 +    await this._runFfmpeg(ffmpeg, args, state.capturedMs, report);
 +
-+    // 4. Tidy up.
++    // 5. Tidy up. Parts left out as repeats are deleted with the rest; the
++    //    unreadable ones stay.
 +    const keepParts = Services.prefs.getBoolPref(PREF_KEEP_PARTS, false);
 +    const toRemove = [...temporaries];
 +    if (!keepParts) {
@@ -700,6 +814,55 @@
 +      // Reported without a size.
 +    }
 +    this._finishMerge(session, { output, outputBytes });
++  },
++
++  /**
++   * Re-encodes one part to the main rendition's size (letterboxed when the
++   * aspect differs), H.264 with the main part's profile and time scale,
++   * without B-frames (reordered timestamps and the edit list they bring made
++   * the concat demuxer place packets out of order), audio copied.
++   */
++  async _rescalePart(ffmpeg, part, main, target, report) {
++    const profile = /high/i.test(main.profile)
++      ? "high"
++      : /baseline/i.test(main.profile)
++        ? "baseline"
++        : "main";
++    const size = `${main.width}:${main.height}`;
++    const filter =
++      `scale=${size}:force_original_aspect_ratio=decrease:flags=bicubic,` +
++      `pad=${size}:(ow-iw)/2:(oh-ih)/2,setsar=1`;
++    await this._runFfmpeg(
++      ffmpeg,
++      [
++        "-i",
++        part.file,
++        "-vf",
++        filter,
++        "-c:v",
++        "libx264",
++        "-preset",
++        "veryfast",
++        "-crf",
++        "20",
++        "-profile:v",
++        profile,
++        "-pix_fmt",
++        "yuv420p",
++        "-g",
++        "60",
++        "-bf",
++        "0",
++        ...(main.timescale ? ["-video_track_timescale", String(main.timescale)] : []),
++        "-c:a",
++        "copy",
++        "-movflags",
++        "+faststart",
++        target,
++      ],
++      part.span * 1000,
++      report
++    );
 +  },
 +
 +  async _finishMerge(session, { output = null, outputBytes = 0, error = null }) {
@@ -770,13 +933,22 @@
 +  },
 +
 +  /**
-+   * The start time of a media file in seconds via ffprobe (next to ffmpeg),
-+   * or null when it cannot be determined.
++   * What ffprobe (next to ffmpeg) says about a file: its start time in
++   * seconds (null when unknown) and the video stream's size, codec, profile
++   * and time scale (zeros / empty without one or without ffprobe).
 +   */
-+  async _probeStart(ffmpeg, file) {
++  async _probeInfo(ffmpeg, file) {
++    const info = {
++      start: null,
++      width: 0,
++      height: 0,
++      codec: "",
++      profile: "",
++      timescale: 0,
++    };
 +    const ffprobe = ffmpeg.replace(/ffmpeg([^/]*)$/, "ffprobe$1");
 +    if (ffprobe === ffmpeg || !(await IOUtils.exists(ffprobe))) {
-+      return null;
++      return info;
 +    }
 +    try {
 +      const proc = await lazy.Subprocess.call({
@@ -785,9 +957,9 @@
 +          "-v",
 +          "error",
 +          "-show_entries",
-+          "format=start_time",
++          "format=start_time:stream=codec_type,codec_name,profile,width,height,time_base",
 +          "-of",
-+          "default=noprint_wrappers=1:nokey=1",
++          "json",
 +          file,
 +        ],
 +      });
@@ -800,11 +972,25 @@
 +        out += chunk;
 +      }
 +      const { exitCode } = await proc.wait();
-+      const start = parseFloat(out);
-+      return exitCode === 0 && Number.isFinite(start) ? start : null;
++      if (exitCode !== 0) {
++        return info;
++      }
++      const data = JSON.parse(out);
++      const start = parseFloat(data.format?.start_time);
++      info.start = Number.isFinite(start) ? start : null;
++      const video = (data.streams || []).find(s => s.codec_type === "video");
++      if (video) {
++        info.width = Number(video.width) || 0;
++        info.height = Number(video.height) || 0;
++        info.codec = String(video.codec_name || "");
++        info.profile = String(video.profile || "");
++        const timeBase = /^1\/(\d{1,7})$/.exec(String(video.time_base || ""));
++        info.timescale = timeBase ? Number(timeBase[1]) : 0;
++      }
 +    } catch (e) {
-+      return null;
++      // Reported as unknown.
 +    }
++    return info;
 +  },
 +
 +  async _ffmpegPath() {

@@ -63,7 +63,7 @@
  namespace mozilla {
  
  class AbstractThread;
-@@ -147,6 +149,35 @@
+@@ -147,6 +149,40 @@
  
    // Interface for MediaSourceDemuxer
    MediaInfo GetMetadata() const;
@@ -84,6 +84,11 @@
 +    int64_t mEndUs = -1;
 +    // Media time written so far (the recorded intervals' total length).
 +    int64_t mRecordedUs = 0;
++    // Segments left out: already recorded, dropped while waiting for a
++    // keyframe to start a part, dropped for a zero-size sample.
++    uint32_t mSkippedSegments = 0;
++    uint32_t mKeyframeWaits = 0;
++    uint32_t mEmptySegments = 0;
 +  };
 +  DumpStats GetDumpStats() const;
 +  // A track of the current init segment: MP4 track_ID with its mdhd
@@ -99,7 +104,7 @@
    const TrackBuffer& GetTrackBuffer(TrackInfo::TrackType aTrack) const;
    const media::TimeIntervals& Buffered(TrackInfo::TrackType) const;
    const media::TimeUnit& HighestStartTime(TrackInfo::TrackType) const;
-@@ -252,6 +283,69 @@
+@@ -252,6 +288,72 @@
    void AppendDataToCurrentInputBuffer(const MediaSpan& aData)
        MOZ_REQUIRES(mTaskQueueCapability);
  
@@ -165,6 +170,9 @@
 +  Atomic<int64_t> mDumpStartUs{-1};
 +  Atomic<int64_t> mDumpEndUs{-1};
 +  Atomic<int64_t> mDumpRecordedUs{0};
++  Atomic<uint32_t> mDumpSkippedSegments{0};
++  Atomic<uint32_t> mDumpKeyframeWaits{0};
++  Atomic<uint32_t> mDumpEmptySegments{0};
 +
    RefPtr<MediaByteBuffer> mInitData MOZ_GUARDED_BY(mTaskQueueCapability);
  
@@ -184,7 +192,7 @@
  
  extern mozilla::LogModule* GetMediaSourceLog();
  
-@@ -105,7 +108,968 @@
+@@ -105,7 +108,977 @@
    DDLINKCHILD("parser", mParser.get());
  }
  
@@ -223,6 +231,9 @@
 +  stats.mStartUs = mDumpStartUs;
 +  stats.mEndUs = mDumpEndUs;
 +  stats.mRecordedUs = mDumpRecordedUs;
++  stats.mSkippedSegments = mDumpSkippedSegments;
++  stats.mKeyframeWaits = mDumpKeyframeWaits;
++  stats.mEmptySegments = mDumpEmptySegments;
 +  return stats;
 +}
 +
@@ -252,6 +263,9 @@
 +  mDumpStartUs = -1;
 +  mDumpEndUs = -1;
 +  mDumpRecordedUs = 0;
++  mDumpSkippedSegments = 0;
++  mDumpKeyframeWaits = 0;
++  mDumpEmptySegments = 0;
 +  mDumpError = false;
 +  mDumpCurrentInit = nullptr;
 +  mDumpTracks.Clear();
@@ -1063,6 +1077,7 @@
 +  if (mDumpExt.EqualsLiteral("mp4") &&
 +      SegmentHasEmptySample(mDumpPending.Elements(), length)) {
 +    MSE_DEBUG("Dump: dropping a segment with a zero-size sample");
++    mDumpEmptySegments++;
 +    return;
 +  }
 +  if (!DumpSegmentRange(start, end)) {
@@ -1081,6 +1096,7 @@
 +    if (mDumpRecorded.Contains(range)) {
 +      MSE_DEBUG("Dump: segment [{}, {}] recorded before, skipping", start,
 +                end);
++      mDumpSkippedSegments++;
 +      return;
 +    }
 +    if (mDumpFile && !mDumpNeedPart && mDumpPartLastEndUs >= 0 &&
@@ -1099,6 +1115,7 @@
 +      MSE_DEBUG("Dump: segment [{}, {}] does not start with a keyframe, "
 +                "waiting for one",
 +                start, end);
++      mDumpKeyframeWaits++;
 +      return;
 +    }
 +    if (!DumpOpenPart()) {
@@ -1154,7 +1171,7 @@
  
  RefPtr<TrackBuffersManager::AppendPromise> TrackBuffersManager::AppendData(
      already_AddRefed<MediaByteBuffer> aData,
-@@ -249,6 +1213,8 @@
+@@ -249,6 +1222,8 @@
        break;
      case Type::Detach:
        mCurrentInputBuffer = nullptr;
@@ -1163,7 +1180,7 @@
        MOZ_DIAGNOSTIC_ASSERT(mQueue.Length() == 0,
                              "Detach task must be the last");
        mVideoTracks.Reset();
-@@ -511,6 +1477,7 @@
+@@ -511,6 +1486,7 @@
      // The demuxer will be recreated during the next run of SegmentParserLoop.
      // As such we don't need to notify it that data has been removed.
      mCurrentInputBuffer = new SourceBufferResource();
@@ -1171,7 +1188,7 @@
    }
  
    // We could be left with a demuxer in an unusable state. It needs to be
-@@ -967,6 +1934,11 @@
+@@ -967,6 +1943,11 @@
        if (NS_SUCCEEDED(haveMediaSegment)) {
          SetAppendState(AppendState::PARSING_MEDIA_SEGMENT);
          mNewMediaSegmentStarted = true;
@@ -1183,7 +1200,7 @@
          continue;
        }
        // We have neither an init segment nor a media segment.
-@@ -1004,6 +1976,11 @@
+@@ -1004,6 +1985,11 @@
          RejectAppend(newData, __func__);
          return;
        }
@@ -1195,7 +1212,7 @@
        mProcessedInput += mInputBuffer->Length();
      }
  
-@@ -1205,6 +2182,7 @@
+@@ -1205,6 +2191,7 @@
    // that data has been appended yet ; so we simply append the init segment
    // to the resource.
    mCurrentInputBuffer->AppendData(mParser->InitData());
@@ -1203,7 +1220,7 @@
    CreateDemuxerforMIMEType();
    if (!mInputDemuxer) {
      RejectAppend(NS_ERROR_FAILURE, __func__);
-@@ -1274,6 +2252,7 @@
+@@ -1274,6 +2261,7 @@
      const MediaSpan& aData) {
    MOZ_ASSERT(mCurrentInputBuffer);
    mCurrentInputBuffer->AppendData(aData);
@@ -1211,7 +1228,7 @@
    mInputDemuxer->NotifyDataArrived();
  }
  
-@@ -1301,6 +2280,7 @@
+@@ -1301,6 +2289,7 @@
    // that data has been appended yet ; so we simply append the init segment
    // to the resource.
    mCurrentInputBuffer->AppendData(mParser->InitData());
@@ -1219,7 +1236,7 @@
    uint32_t length = endInit - (mProcessedInput - mInputBuffer->Length());
    MOZ_RELEASE_ASSERT(length <= mInputBuffer->Length());
    mInputBuffer->RemoveFront(length);
-@@ -1703,6 +2683,7 @@
+@@ -1703,6 +2692,7 @@
        // We've completed our earlier media segment and no new data is to be
        // processed. This happens with some containers that can't detect that a
        // media segment is ending until a new one starts.
@@ -1227,7 +1244,7 @@
        RefPtr<CodedFrameProcessingPromise> p =
            mProcessingPromise.Ensure(__func__);
        CompleteCodedFrameProcessing();
-@@ -1710,6 +2691,7 @@
+@@ -1710,6 +2700,7 @@
      }
      AppendDataToCurrentInputBuffer(mInputBuffer->To(length));
      mInputBuffer->RemoveFront(length);
@@ -1306,7 +1323,7 @@
    StartUpdating();
  
    mTrackBuffersManager->AppendData(aData.forget(), mCurrentAttributes)
-@@ -644,11 +657,210 @@
+@@ -644,11 +657,216 @@
  
    CheckEndTime();
  
@@ -1491,6 +1508,12 @@
 +  json.AppendInt(stats.mEndUs);
 +  json.AppendLiteral(",\"recordedUs\":");
 +  json.AppendInt(stats.mRecordedUs);
++  json.AppendLiteral(",\"skippedSegments\":");
++  json.AppendInt(stats.mSkippedSegments);
++  json.AppendLiteral(",\"keyframeWaits\":");
++  json.AppendInt(stats.mKeyframeWaits);
++  json.AppendLiteral(",\"emptySegments\":");
++  json.AppendInt(stats.mEmptySegments);
 +  json.AppendLiteral(",\"dir\":");
 +  AppendJSONString(json, mDumpDir);
 +  json.AppendLiteral(",\"base\":");
