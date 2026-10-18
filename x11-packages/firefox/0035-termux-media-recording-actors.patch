@@ -14,7 +14,7 @@
 +]
 --- /dev/null
 +++ b/toolkit/components/termux/TermuxMediaRecording.sys.mjs
-@@ -0,0 +1,1066 @@
+@@ -0,0 +1,1133 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -294,6 +294,9 @@
 +      // the dump is on. The finished recording lives on in the history.
 +      const fresh = new Session(session.browsingContext);
 +      for (const [key, track] of session.tracks) {
++        if (track.state === "ended") {
++          continue;
++        }
 +        fresh.tracks.set(key, {
 +          ...track,
 +          bytes: 0,
@@ -406,16 +409,27 @@
 +
 +    if (data.state === "ended") {
 +      const session = this._sessions.get(top.id);
-+      if (!session) {
++      const track = session?.tracks.get(key);
++      if (!track) {
 +        return;
 +      }
-+      session.tracks.delete(key);
-+      if (session.tracks.size === 0) {
-+        if (session.status === "recording" || session.status === "paused") {
-+          // The page went away mid-recording: keep what was captured.
-+          session.endedByPage = true;
-+          this.stop(top).catch(console.error);
-+        } else if (session.status === "idle" || session.status === "error") {
++      if (session.status === "recording" || session.status === "paused") {
++        // The buffer went away mid-recording: a page that replaces its
++        // player (a small and a large one, a reload of the stream) does this
++        // and feeds a new buffer right after. The files written so far stay
++        // part of the recording and the recording goes on; a page that goes
++        // away for good is handled in onWindowGone.
++        session.tracks.set(key, {
++          ...track,
++          state: "ended",
++          updatedAt: Date.now(),
++        });
++      } else {
++        session.tracks.delete(key);
++        if (
++          session.tracks.size === 0 &&
++          (session.status === "idle" || session.status === "error")
++        ) {
 +          this._sessions.delete(top.id);
 +        }
 +      }
@@ -448,6 +462,54 @@
 +      this._emit("stream-detected", session);
 +    }
 +    this._emit("state-changed", session);
++  },
++
++  /**
++   * Called by TermuxMediaRecordingParent when a window (its actor) is gone:
++   * navigation or a closed tab. Its buffers cannot report any more, so they
++   * count as ended; a recording with no live buffer left stops and keeps
++   * what was captured.
++   */
++  onWindowGone(topId, innerWindowId) {
++    const session = this._sessions.get(topId);
++    if (!session) {
++      return;
++    }
++    const prefix = `${innerWindowId}:`;
++    let changed = false;
++    for (const [key, track] of session.tracks) {
++      if (key.startsWith(prefix) && track.state !== "ended") {
++        session.tracks.set(key, {
++          ...track,
++          state: "ended",
++          updatedAt: Date.now(),
++        });
++        changed = true;
++      }
++    }
++    if (session.status === "recording" || session.status === "paused") {
++      const live = [...session.tracks.values()].some(t => t.state !== "ended");
++      if (!live && session.tracks.size) {
++        session.endedByPage = true;
++        this.stop(session.browsingContext).catch(console.error);
++        return;
++      }
++    } else if (session.status === "idle" || session.status === "error") {
++      for (const [key, track] of session.tracks) {
++        if (track.state === "ended") {
++          session.tracks.delete(key);
++          changed = true;
++        }
++      }
++      if (!session.tracks.size) {
++        this._sessions.delete(topId);
++        this._emit("state-changed", session);
++        return;
++      }
++    }
++    if (changed) {
++      this._emit("state-changed", session);
++    }
 +  },
 +
 +  _sessionFor(browsingContext, create) {
@@ -519,7 +581,7 @@
 +    const tracks = [];
 +    let bytes = 0;
 +    let parts = 0;
-+    let capturedMs = 0;
++    const capturedUsByKind = new Map();
 +    let encrypted = false;
 +    let noDir = false;
 +    let writeError = false;
@@ -531,8 +593,13 @@
 +      bytes += t.bytes || 0;
 +      parts += t.parts || 0;
 +      // The media time written (the recorded intervals' total), not the
-+      // span between the first and the last timestamp.
-+      capturedMs = Math.max(capturedMs, (t.recordedUs || 0) / 1000);
++      // span between the first and the last timestamp. The buffers of one
++      // kind add up (a page that replaces its player continues the program
++      // in a new buffer); video and audio run in parallel.
++      capturedUsByKind.set(
++        t.kind,
++        (capturedUsByKind.get(t.kind) || 0) + (t.recordedUs || 0)
++      );
 +      encrypted = encrypted || !!t.encrypted;
 +      noDir = noDir || !!t.noDir;
 +      writeError = writeError || !!t.writeError;
@@ -582,7 +649,7 @@
 +      error,
 +      bytes,
 +      parts,
-+      capturedMs: Math.round(capturedMs),
++      capturedMs: Math.round(Math.max(0, ...capturedUsByKind.values()) / 1000),
 +      tracks,
 +      files,
 +      progress: session.progress,
@@ -1124,7 +1191,7 @@
 +}
 --- /dev/null
 +++ b/toolkit/actors/TermuxMediaRecordingParent.sys.mjs
-@@ -0,0 +1,22 @@
+@@ -0,0 +1,32 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -1143,7 +1210,17 @@
 +export class TermuxMediaRecordingParent extends JSWindowActorParent {
 +  receiveMessage(message) {
 +    if (message.name === "TermuxMediaRecording:State") {
++      // Kept for didDestroy, when the browsing context may be gone already.
++      this._topId = this.browsingContext?.top?.id ?? this._topId;
++      this._innerWindowId =
++        this.manager?.innerWindowId ?? this._innerWindowId;
 +      lazy.TermuxMediaRecording.onContentState(this, message.data);
++    }
++  }
++
++  didDestroy() {
++    if (this._topId !== undefined && this._innerWindowId !== undefined) {
++      lazy.TermuxMediaRecording.onWindowGone(this._topId, this._innerWindowId);
 +    }
 +  }
 +}
