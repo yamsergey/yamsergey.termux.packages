@@ -794,8 +794,8 @@
 +
 +    // 4. Mux them together, keeping the tracks' relative start. ffmpeg
 +    // rebases every input to zero, and the video and audio buffers rarely
-+    // begin at the same instant (YouTube: seconds apart), so each input is
-+    // shifted by its start relative to the earliest one.
++    // begin at the same instant (a page may fill them seconds apart), so
++    // each input is shifted by its start relative to the earliest one.
 +    const starts = inputs.map(input => input.start);
 +    const earliest = starts.every(s => s !== null) ? Math.min(...starts) : null;
 +    const args = [];
