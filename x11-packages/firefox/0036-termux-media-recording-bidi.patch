@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/remote/webdriver-bidi/modules/root/termux.sys.mjs
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,219 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -23,9 +23,9 @@
 + * Termux media recording (yamsergey.termux.packages patch 0036).
 + *
 + * Commands
-+ *   termux.setMediaRecording      {context, action, fromBeginning?} -> state
-+ *   termux.getMediaRecordingState {context}                         -> state
-+ *   termux.listRecordings         {}                                -> {recordings}
++ *   termux.setMediaRecording      {context, action} -> state
++ *   termux.getMediaRecordingState {context}         -> state
++ *   termux.listRecordings         {}                -> {recordings}
 + *
 + * Events
 + *   termux.mediaStreamDetected         a tab gained its first MSE track
@@ -49,7 +49,7 @@
 +  }
 +
 +  async setMediaRecording(options = {}) {
-+    const { context: contextId, action, fromBeginning = false } = options;
++    const { context: contextId, action } = options;
 +
 +    lazy.assert.string(
 +      contextId,
@@ -63,17 +63,12 @@
 +      value => ACTIONS.includes(value),
 +      lazy.pprint`Expected "action" to be one of ${ACTIONS}, got ${action}`
 +    )(action);
-+    lazy.assert.boolean(
-+      fromBeginning,
-+      lazy.pprint`Expected "fromBeginning" to be a boolean, got ${fromBeginning}`
-+    );
-+
 +    const context = this._getNavigable(contextId);
 +    const top = context.top;
 +
 +    switch (action) {
 +      case "start":
-+        await lazy.TermuxMediaRecording.start(top, { fromBeginning });
++        await lazy.TermuxMediaRecording.start(top);
 +        break;
 +      case "pause":
 +        lazy.TermuxMediaRecording.pause(top);

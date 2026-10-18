@@ -14,7 +14,7 @@
 +]
 --- /dev/null
 +++ b/toolkit/components/termux/TermuxMediaRecording.sys.mjs
-@@ -0,0 +1,843 @@
+@@ -0,0 +1,864 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -76,13 +76,10 @@
 +    this.browsingContextId = topBrowsingContext.id;
 +    // `${innerWindowId}:${trackId}` -> last report from the content process.
 +    this.tracks = new Map();
-+    // JSWindowActorParent instances that reported a track (for SeekToStart).
-+    this.actors = new Set();
 +    // idle | recording | paused | saving | ready | partial | error
 +    this.status = "idle";
 +    this.startedAt = null;
 +    this.stoppedAt = null;
-+    this.fromBeginning = false;
 +    this.dir = "";
 +    this.title = "";
 +    this.url = "";
@@ -161,6 +158,7 @@
 +    parts: hasFiles ? Math.min(9999, Math.max(0, int(raw.parts))) : 0,
 +    startUs: int(raw.startUs, -1),
 +    endUs: int(raw.endUs, -1),
++    recordedUs: Math.max(0, int(raw.recordedUs)),
 +    dir: hasFiles ? dir : "",
 +    base: hasFiles ? base : "",
 +    ext: hasFiles ? ext : "",
@@ -215,10 +213,38 @@
 +    return [...this._history, ...live];
 +  },
 +
-+  async start(browsingContext, { fromBeginning = false } = {}) {
-+    const session = this._sessionFor(browsingContext, true);
++  async start(browsingContext) {
++    let session = this._sessionFor(browsingContext, true);
 +    if (session.status === "saving") {
 +      throw new Error("the previous recording is still being saved");
++    }
++    if (session.status === "recording" || session.status === "paused") {
++      throw new Error("a recording is already running");
++    }
++    if (session.status !== "idle") {
++      // Record again in the same tab: a fresh session, so that nothing of the
++      // finished one (its parts were deleted by the merge) carries over. The
++      // tracks are kept as known streams; their files are reported anew once
++      // the dump is on. The finished recording lives on in the history.
++      const fresh = new Session(session.browsingContext);
++      for (const [key, track] of session.tracks) {
++        fresh.tracks.set(key, {
++          ...track,
++          bytes: 0,
++          parts: 0,
++          startUs: -1,
++          endUs: -1,
++          recordedUs: 0,
++          dir: "",
++          base: "",
++          ext: "",
++        });
++      }
++      fresh.title = session.title;
++      fresh.url = session.url;
++      fresh.origin = session.origin;
++      session = fresh;
++      this._sessions.set(session.browsingContextId, session);
 +    }
 +    const dir = Services.prefs.getStringPref(PREF_DIR, "");
 +    if (!dir) {
@@ -232,7 +258,6 @@
 +    session.status = "recording";
 +    session.startedAt = Date.now();
 +    session.stoppedAt = null;
-+    session.fromBeginning = !!fromBeginning;
 +    session.summaryPath = null;
 +    session.progress = 0;
 +    session.output = null;
@@ -242,9 +267,6 @@
 +    session.frozenTracks = null;
 +    this._refreshMeta(session);
 +    this._setFlag(session, true);
-+    if (fromBeginning) {
-+      this._seekToStart(session);
-+    }
 +    this._emit("state-changed", session);
 +    return this._stateOf(session);
 +  },
@@ -319,7 +341,6 @@
 +        return;
 +      }
 +      session.tracks.delete(key);
-+      session.actors.delete(actor);
 +      if (session.tracks.size === 0) {
 +        if (session.status === "recording" || session.status === "paused") {
 +          // The page went away mid-recording: keep what was captured.
@@ -345,12 +366,9 @@
 +    } else if (session.tracks.size === 0 && finished) {
 +      // A new video after a finished recording in the same tab: start clean,
 +      // the finished one lives on in the history.
-+      const fresh = new Session(top);
-+      fresh.actors = session.actors;
-+      session = fresh;
++      session = new Session(top);
 +      this._sessions.set(top.id, session);
 +    }
-+    session.actors.add(actor);
 +    const isNew = !session.tracks.has(key);
 +    session.tracks.set(key, { ...data, key, updatedAt: Date.now() });
 +    this._refreshMeta(session);
@@ -383,16 +401,6 @@
 +      }
 +    } catch (e) {
 +      console.error("TermuxMediaRecording: cannot set the flag", e);
-+    }
-+  },
-+
-+  _seekToStart(session) {
-+    for (const actor of session.actors) {
-+      try {
-+        actor.sendAsyncMessage("TermuxMediaRecording:SeekToStart");
-+      } catch (e) {
-+        // The window is gone; its tracks will report "ended".
-+      }
 +    }
 +  },
 +
@@ -437,9 +445,9 @@
 +      files.push(...trackFileList);
 +      bytes += t.bytes || 0;
 +      parts += t.parts || 0;
-+      if (t.startUs >= 0 && t.endUs > t.startUs) {
-+        capturedMs = Math.max(capturedMs, (t.endUs - t.startUs) / 1000);
-+      }
++      // The media time written (the recorded intervals' total), not the
++      // span between the first and the last timestamp.
++      capturedMs = Math.max(capturedMs, (t.recordedUs || 0) / 1000);
 +      encrypted = encrypted || !!t.encrypted;
 +      noDir = noDir || !!t.noDir;
 +      writeError = writeError || !!t.writeError;
@@ -458,6 +466,7 @@
 +        parts: t.parts || 0,
 +        startUs: t.startUs,
 +        endUs: t.endUs,
++        recordedUs: t.recordedUs || 0,
 +        files: trackFileList,
 +      });
 +    }
@@ -476,7 +485,6 @@
 +      origin: session.origin,
 +      startedAt: session.startedAt,
 +      stoppedAt: session.stoppedAt,
-+      fromBeginning: session.fromBeginning,
 +      endedByPage: session.endedByPage,
 +      dir: session.dir,
 +      encrypted,
@@ -539,11 +547,8 @@
 +      }
 +      const entry = byKind.get(track.kind);
 +      entry.files.push(...track.files);
-+      if (track.startUs >= 0 && track.endUs > track.startUs) {
-+        entry.durationMs = Math.max(
-+          entry.durationMs,
-+          (track.endUs - track.startUs) / 1000
-+        );
++      entry.durationMs = Math.max(entry.durationMs, track.recordedUs / 1000);
++      if (track.startUs >= 0) {
 +        entry.startUs = Math.min(entry.startUs, track.startUs);
 +      }
 +      if (track.files.some(f => f.endsWith(".webm"))) {
@@ -577,22 +582,38 @@
 +    // 1. Measure every part: where it starts in the stream's timeline
 +    //    (ffprobe) and how much media it really holds (a stream-copy pass to
 +    //    the null muxer). The header cannot be trusted for the length: a live
-+    //    stream's init segment may claim hours.
++    //    stream's init segment may claim hours. A part ffmpeg cannot read
++    //    (or one without media) would fail the whole concat: it is left out
++    //    and kept on disk.
 +    const tracks = [];
++    const unreadable = [];
 +    for (const [kind, entry] of byKind) {
 +      const parts = [];
 +      for (const file of entry.files) {
-+        parts.push({
-+          file,
-+          start: await this._probeStart(ffmpeg, file),
-+          span: await this._measureSpan(ffmpeg, file),
-+        });
++        if (!(await IOUtils.exists(file))) {
++          console.warn(`TermuxMediaRecording: ${file} is missing`);
++          continue;
++        }
++        const span = await this._measureSpan(ffmpeg, file);
++        if (!span) {
++          console.warn(`TermuxMediaRecording: ${file} has no readable media`);
++          unreadable.push(file);
++          continue;
++        }
++        parts.push({ file, start: await this._probeStart(ffmpeg, file), span });
++      }
++      if (!parts.length) {
++        continue;
 +      }
 +      let start = parts[0].start;
 +      if (start === null && Number.isFinite(entry.startUs)) {
 +        start = entry.startUs / 1e6;
 +      }
 +      tracks.push({ kind, entry, parts, start });
++    }
++    if (!tracks.length) {
++      this._finishMerge(session, { error: "nothing was captured" });
++      return;
 +    }
 +
 +    // 2. One file per track. Parts are contiguous runs of media time in
@@ -667,7 +688,7 @@
 +    const keepParts = Services.prefs.getBoolPref(PREF_KEEP_PARTS, false);
 +    const toRemove = [...temporaries];
 +    if (!keepParts) {
-+      toRemove.push(...state.files);
++      toRemove.push(...state.files.filter(f => !unreadable.includes(f)));
 +    }
 +    for (const f of toRemove) {
 +      await IOUtils.remove(f, { ignoreAbsent: true }).catch(() => {});
@@ -870,7 +891,7 @@
      "timermanager",
 --- /dev/null
 +++ b/toolkit/actors/TermuxMediaRecordingChild.sys.mjs
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,28 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -880,7 +901,7 @@
 + *
 + * Forwards the "termux-media-recording" observer notifications that
 + * SourceBuffer fires (patch 0034; subject: the window, data: JSON) to the
-+ * parent, and rewinds the page's MSE media elements on request.
++ * parent.
 + */
 +export class TermuxMediaRecordingChild extends JSWindowActorChild {
 +  observe(subject, topic, data) {
@@ -897,26 +918,6 @@
 +    payload.title = doc?.title || "";
 +    payload.url = doc?.location?.href || "";
 +    this.sendAsyncMessage("TermuxMediaRecording:State", payload);
-+  }
-+
-+  receiveMessage(message) {
-+    if (message.name !== "TermuxMediaRecording:SeekToStart") {
-+      return;
-+    }
-+    const doc = this.document;
-+    if (!doc) {
-+      return;
-+    }
-+    for (const element of doc.querySelectorAll("video, audio")) {
-+      try {
-+        const src = element.currentSrc || element.src || "";
-+        if (element.srcObject || src.startsWith("blob:")) {
-+          element.currentTime = 0;
-+        }
-+      } catch (e) {
-+        // Not seekable right now; the recording simply starts from here.
-+      }
-+    }
 +  }
 +}
 --- /dev/null

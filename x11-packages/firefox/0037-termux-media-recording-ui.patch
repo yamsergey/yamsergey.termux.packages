@@ -14,7 +14,7 @@
 +]
 --- /dev/null
 +++ b/browser/components/termux/TermuxRecordingUI.sys.mjs
-@@ -0,0 +1,480 @@
+@@ -0,0 +1,461 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -412,24 +412,7 @@
 +      status === "ready" ||
 +      status === "partial" ||
 +      status === "error";
-+    let fromStart = null;
 +    if (!state?.encrypted && idleLike) {
-+      const option = row();
-+      option.style.alignItems = "flex-start";
-+      fromStart = this._el(doc, "input", "margin: 2px 0 0; width: 16px; height: 16px;");
-+      fromStart.type = "checkbox";
-+      fromStart.id = `${PANEL_ID}-from-start`;
-+      fromStart.checked = true;
-+      const label = this._el(doc, "label", "display: flex; flex-direction: column; gap: 2px; cursor: pointer;");
-+      label.htmlFor = fromStart.id;
-+      label.appendChild(this._el(doc, "span", "", "Start from the beginning"));
-+      label.appendChild(
-+        this._el(doc, "span", muted, "Rewinds the video so the whole thing is captured, not just from here.")
-+      );
-+      option.appendChild(fromStart);
-+      option.appendChild(label);
-+      content.appendChild(option);
-+
 +      const dir = Services.prefs.getStringPref("media.termux.recording.dir", "");
 +      content.appendChild(
 +        this._el(doc, "span", muted, dir ? `Saves to ${dir}` : "media.termux.recording.dir is not set")
@@ -486,9 +469,7 @@
 +      );
 +      buttons.appendChild(
 +        this._button(doc, status === "idle" ? "Start recording" : "Record again", true, () => {
-+          recorder
-+            .start(browsingContext, { fromBeginning: !!fromStart?.checked })
-+            .catch(console.error);
++          recorder.start(browsingContext).catch(console.error);
 +        })
 +      );
 +    }
