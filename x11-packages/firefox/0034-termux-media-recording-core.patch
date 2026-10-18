@@ -63,7 +63,7 @@
  namespace mozilla {
  
  class AbstractThread;
-@@ -147,6 +149,33 @@
+@@ -147,6 +149,35 @@
  
    // Interface for MediaSourceDemuxer
    MediaInfo GetMetadata() const;
@@ -87,17 +87,19 @@
 +  };
 +  DumpStats GetDumpStats() const;
 +  // A track of the current init segment: MP4 track_ID with its mdhd
-+  // timescale and trex default sample duration, or WebM TrackNumber with its
-+  // DefaultDuration in ns.
++  // timescale, trex default sample duration and flags, or WebM TrackNumber
++  // with its DefaultDuration in ns; mVideo for a video handler / track type.
 +  struct DumpTrack {
 +    uint64_t mId = 0;
 +    uint64_t mScale = 0;
 +    uint64_t mDefaultDuration = 0;
++    uint32_t mDefaultFlags = 0;
++    bool mVideo = false;
 +  };
    const TrackBuffer& GetTrackBuffer(TrackInfo::TrackType aTrack) const;
    const media::TimeIntervals& Buffered(TrackInfo::TrackType) const;
    const media::TimeUnit& HighestStartTime(TrackInfo::TrackType) const;
-@@ -252,6 +281,68 @@
+@@ -252,6 +283,69 @@
    void AppendDataToCurrentInputBuffer(const MediaSpan& aData)
        MOZ_REQUIRES(mTaskQueueCapability);
  
@@ -132,6 +134,7 @@
 +  // fragments (fMP4) or clusters (WebM) with the current init segment's
 +  // per-track clocks.
 +  bool DumpSegmentRange(int64_t& aStartUs, int64_t& aEndUs) const;
++  bool DumpSegmentStartsWithKeyframe() const;
 +  // Start a new part file, beginning with the current init segment.
 +  bool DumpOpenPart();
 +  void DumpClose();
@@ -181,7 +184,7 @@
  
  extern mozilla::LogModule* GetMediaSourceLog();
  
-@@ -105,7 +108,773 @@
+@@ -105,7 +108,968 @@
    DDLINKCHILD("parser", mParser.get());
  }
  
@@ -314,8 +317,8 @@
 +                 (aTicks % aScale) * 1000000 / aScale);
 +}
 +
-+// The tracks of an fMP4 init segment: track_ID, mdhd timescale and the trex
-+// default sample duration. The timescales differ per track (90 kHz video
++// The tracks of an fMP4 init segment: track_ID, mdhd timescale, hdlr type
++// and the trex default sample duration and flags. The timescales differ per track (90 kHz video
 +// next to 48 kHz audio is common), which is why the segments' times are read
 +// here per track rather than taken from ContainerParser, whose multi-track
 +// mode applies one timescale to all of them.
@@ -324,6 +327,7 @@
 +  struct Default {
 +    uint32_t mId;
 +    uint32_t mDuration;
++    uint32_t mFlags;
 +  };
 +  AutoTArray<Default, 2> defaults;
 +  ForEachBox(aData, 0, aLength, [&](uint32_t aType, size_t aStart,
@@ -351,6 +355,9 @@
 +                if (at + 4 <= aEnd) {
 +                  track.mScale = ReadU32(aData, at);
 +                }
++              } else if (aType == Fourcc("hdlr") && aStart + 12 <= aEnd) {
++                // version, flags, pre_defined, handler_type.
++                track.mVideo = ReadU32(aData, aStart + 8) == Fourcc("vide");
 +              }
 +            });
 +          }
@@ -361,9 +368,13 @@
 +      } else if (aType == Fourcc("mvex")) {
 +        ForEachBox(aData, aStart, aEnd, [&](uint32_t aType, size_t aStart,
 +                                            size_t aEnd) {
-+          if (aType == Fourcc("trex") && aStart + 16 <= aEnd) {
-+            defaults.AppendElement(
-+                Default{ReadU32(aData, aStart + 4), ReadU32(aData, aStart + 12)});
++          if (aType == Fourcc("trex") && aStart + 24 <= aEnd) {
++            // version, flags, track_ID, default_sample_description_index,
++            // default_sample_duration, default_sample_size,
++            // default_sample_flags.
++            defaults.AppendElement(Default{ReadU32(aData, aStart + 4),
++                                           ReadU32(aData, aStart + 12),
++                                           ReadU32(aData, aStart + 20)});
 +          }
 +        });
 +      }
@@ -373,6 +384,7 @@
 +    for (auto& track : aTracks) {
 +      if (track.mId == d.mId) {
 +        track.mDefaultDuration = d.mDuration;
++        track.mDefaultFlags = d.mFlags;
 +      }
 +    }
 +  }
@@ -463,6 +475,99 @@
 +  aStartUs = startUs;
 +  aEndUs = endUs;
 +  return true;
++}
++
++// Sample flags as ffmpeg reads them: a sample is a keyframe unless it is
++// marked non-sync or as depending on other samples.
++constexpr uint32_t kSampleNotKeyframe = 0x01010000;
++
++bool TrackIsVideo(const nsTArray<TrackBuffersManager::DumpTrack>& aTracks,
++                  uint64_t aId) {
++  for (const auto& track : aTracks) {
++    if (track.mId == aId) {
++      return track.mVideo;
++    }
++  }
++  return false;
++}
++
++// False when the first video sample of an fMP4 media segment is not a
++// keyframe (trun first_sample_flags or sample_flags, else the tfhd and trex
++// defaults). A segment without video samples passes.
++bool Mp4SegmentStartsWithKeyframe(
++    const uint8_t* aData, size_t aLength,
++    const nsTArray<TrackBuffersManager::DumpTrack>& aTracks) {
++  bool decided = false;
++  bool keyframe = true;
++  ForEachBox(aData, 0, aLength, [&](uint32_t aType, size_t aStart,
++                                    size_t aEnd) {
++    if (decided || aType != Fourcc("moof")) {
++      return;
++    }
++    ForEachBox(aData, aStart, aEnd, [&](uint32_t aType, size_t aStart,
++                                        size_t aEnd) {
++      if (decided || aType != Fourcc("traf")) {
++        return;
++      }
++      const TrackBuffersManager::DumpTrack* track = nullptr;
++      bool haveFlags = false;
++      uint32_t flags = 0;
++      uint32_t samples = 0;
++      bool firstTrun = true;
++      ForEachBox(aData, aStart, aEnd, [&](uint32_t aType, size_t aStart,
++                                          size_t aEnd) {
++        if (aType == Fourcc("tfhd") && aStart + 8 <= aEnd) {
++          uint32_t tfFlags = ReadU32(aData, aStart) & 0xffffff;
++          uint32_t id = ReadU32(aData, aStart + 4);
++          for (const auto& t : aTracks) {
++            if (t.mId == id) {
++              track = &t;
++            }
++          }
++          size_t pos = aStart + 8;
++          if (tfFlags & 0x1) pos += 8;   // base_data_offset
++          if (tfFlags & 0x2) pos += 4;   // sample_description_index
++          if (tfFlags & 0x8) pos += 4;   // default_sample_duration
++          if (tfFlags & 0x10) pos += 4;  // default_sample_size
++          if ((tfFlags & 0x20) && pos + 4 <= aEnd) {
++            haveFlags = true;
++            flags = ReadU32(aData, pos);
++          }
++        } else if (aType == Fourcc("trun") && aStart + 8 <= aEnd) {
++          uint32_t trFlags = ReadU32(aData, aStart) & 0xffffff;
++          uint32_t count = ReadU32(aData, aStart + 4);
++          samples += count;
++          if (!firstTrun || !count) {
++            return;
++          }
++          firstTrun = false;
++          size_t pos = aStart + 8;
++          if (trFlags & 0x1) pos += 4;  // data_offset
++          if (trFlags & 0x4) {
++            if (pos + 4 <= aEnd) {
++              haveFlags = true;
++              flags = ReadU32(aData, pos);
++            }
++          } else if (trFlags & 0x400) {
++            pos += (trFlags & 0x100 ? 4 : 0) + (trFlags & 0x200 ? 4 : 0);
++            if (pos + 4 <= aEnd) {
++              haveFlags = true;
++              flags = ReadU32(aData, pos);
++            }
++          }
++        }
++      });
++      if (!track || !track->mVideo || !samples) {
++        return;
++      }
++      if (!haveFlags) {
++        flags = track->mDefaultFlags;
++      }
++      keyframe = !(flags & kSampleNotKeyframe);
++      decided = true;
++    });
++  });
++  return keyframe;
 +}
 +
 +// True when an fMP4 media segment lists a sample of zero bytes (a frame a
@@ -603,6 +708,7 @@
 +constexpr uint32_t kEbmlTracks = 0x1654AE6B;
 +constexpr uint32_t kEbmlTrackEntry = 0xAE;
 +constexpr uint32_t kEbmlTrackNumber = 0xD7;
++constexpr uint32_t kEbmlTrackType = 0x83;
 +constexpr uint32_t kEbmlDefaultDuration = 0x23E383;
 +constexpr uint32_t kEbmlCluster = 0x1F43B675;
 +constexpr uint32_t kEbmlTimecode = 0xE7;
@@ -610,6 +716,7 @@
 +constexpr uint32_t kEbmlBlockGroup = 0xA0;
 +constexpr uint32_t kEbmlBlock = 0xA1;
 +constexpr uint32_t kEbmlBlockDuration = 0x9B;
++constexpr uint32_t kEbmlReferenceBlock = 0xFB;
 +
 +// The timecode scale and the tracks' default frame durations (both in ns)
 +// of a WebM init segment.
@@ -641,6 +748,8 @@
 +                                                  size_t aEnd) {
 +            if (aId == kEbmlTrackNumber) {
 +              track.mId = ReadEbmlUint(aData, aStart, aEnd);
++            } else if (aId == kEbmlTrackType) {
++              track.mVideo = ReadEbmlUint(aData, aStart, aEnd) == 1;
 +            } else if (aId == kEbmlDefaultDuration) {
 +              track.mDefaultDuration = ReadEbmlUint(aData, aStart, aEnd);
 +            }
@@ -769,6 +878,72 @@
 +  return true;
 +}
 +
++// Looks for the first video block of a cluster: a SimpleBlock carries a
++// keyframe flag, a BlockGroup is a keyframe when it has no ReferenceBlock.
++void WebMClusterKeyframe(const uint8_t* aData, size_t aStart, size_t aEnd,
++                         const nsTArray<TrackBuffersManager::DumpTrack>& aTracks,
++                         bool& aDecided, bool& aKeyframe) {
++  ForEachElement(aData, aStart, aEnd, [&](uint32_t aId, size_t aStart,
++                                          size_t aEnd) {
++    if (aDecided) {
++      return;
++    }
++    uint64_t trackNumber;
++    size_t length;
++    bool unknown;
++    if (aId == kEbmlSimpleBlock) {
++      if (!ReadEbmlSize(aData, aStart, aEnd, trackNumber, length, unknown) ||
++          aStart + length + 3 > aEnd || !TrackIsVideo(aTracks, trackNumber)) {
++        return;
++      }
++      aKeyframe = aData[aStart + length + 2] & 0x80;
++      aDecided = true;
++    } else if (aId == kEbmlBlockGroup) {
++      bool video = false;
++      bool reference = false;
++      ForEachElement(aData, aStart, aEnd, [&](uint32_t aId, size_t aStart,
++                                              size_t aEnd) {
++        if (aId == kEbmlBlock) {
++          video = ReadEbmlSize(aData, aStart, aEnd, trackNumber, length,
++                               unknown) &&
++                  TrackIsVideo(aTracks, trackNumber);
++        } else if (aId == kEbmlReferenceBlock) {
++          reference = true;
++        }
++      });
++      if (video) {
++        aKeyframe = !reference;
++        aDecided = true;
++      }
++    } else if (aId == kEbmlCluster) {
++      WebMClusterKeyframe(aData, aStart, aEnd, aTracks, aDecided, aKeyframe);
++    }
++  });
++}
++
++// False when the first video block of a WebM media segment is not a
++// keyframe. A segment without video blocks passes.
++bool WebMSegmentStartsWithKeyframe(
++    const uint8_t* aData, size_t aLength,
++    const nsTArray<TrackBuffersManager::DumpTrack>& aTracks) {
++  bool decided = false;
++  bool keyframe = true;
++  auto visit = [&](uint32_t aId, size_t aStart, size_t aEnd) {
++    if (!decided && aId == kEbmlCluster) {
++      WebMClusterKeyframe(aData, aStart, aEnd, aTracks, decided, keyframe);
++    }
++  };
++  ForEachElement(aData, 0, aLength, [&](uint32_t aId, size_t aStart,
++                                        size_t aEnd) {
++    if (aId == kEbmlSegment) {
++      ForEachElement(aData, aStart, aEnd, visit);
++    } else {
++      visit(aId, aStart, aEnd);
++    }
++  });
++  return keyframe;
++}
++
 +}  // namespace
 +
 +// ---- Termux patch 0034: the media dump --------------------------------------
@@ -862,6 +1037,18 @@
 +  return false;
 +}
 +
++bool TrackBuffersManager::DumpSegmentStartsWithKeyframe() const {
++  if (mDumpExt.EqualsLiteral("mp4")) {
++    return Mp4SegmentStartsWithKeyframe(mDumpPending.Elements(),
++                                        mDumpPending.Length(), mDumpTracks);
++  }
++  if (mDumpExt.EqualsLiteral("webm")) {
++    return WebMSegmentStartsWithKeyframe(mDumpPending.Elements(),
++                                         mDumpPending.Length(), mDumpTracks);
++  }
++  return true;
++}
++
 +void TrackBuffersManager::DumpFlushSegment() {
 +  if (!mDumpEnabled || mDumpPending.IsEmpty()) {
 +    return;
@@ -904,8 +1091,19 @@
 +      mDumpNeedPart = true;
 +    }
 +  }
-+  if ((mDumpNeedPart || !mDumpFile) && !DumpOpenPart()) {
-+    return;
++  if (mDumpNeedPart || !mDumpFile) {
++    // ffmpeg's stream copy drops the video before the first keyframe but
++    // keeps the audio of those frames, which would put the picture ahead of
++    // the sound by up to a GOP: a part starts at a keyframe.
++    if (!DumpSegmentStartsWithKeyframe()) {
++      MSE_DEBUG("Dump: segment [{}, {}] does not start with a keyframe, "
++                "waiting for one",
++                start, end);
++      return;
++    }
++    if (!DumpOpenPart()) {
++      return;
++    }
 +  }
 +  DumpWriteBytes(mDumpPending.Elements(), length);
 +  if (!known) {
@@ -956,7 +1154,7 @@
  
  RefPtr<TrackBuffersManager::AppendPromise> TrackBuffersManager::AppendData(
      already_AddRefed<MediaByteBuffer> aData,
-@@ -249,6 +1018,8 @@
+@@ -249,6 +1213,8 @@
        break;
      case Type::Detach:
        mCurrentInputBuffer = nullptr;
@@ -965,7 +1163,7 @@
        MOZ_DIAGNOSTIC_ASSERT(mQueue.Length() == 0,
                              "Detach task must be the last");
        mVideoTracks.Reset();
-@@ -511,6 +1282,7 @@
+@@ -511,6 +1477,7 @@
      // The demuxer will be recreated during the next run of SegmentParserLoop.
      // As such we don't need to notify it that data has been removed.
      mCurrentInputBuffer = new SourceBufferResource();
@@ -973,7 +1171,7 @@
    }
  
    // We could be left with a demuxer in an unusable state. It needs to be
-@@ -967,6 +1739,11 @@
+@@ -967,6 +1934,11 @@
        if (NS_SUCCEEDED(haveMediaSegment)) {
          SetAppendState(AppendState::PARSING_MEDIA_SEGMENT);
          mNewMediaSegmentStarted = true;
@@ -985,7 +1183,7 @@
          continue;
        }
        // We have neither an init segment nor a media segment.
-@@ -1004,6 +1781,11 @@
+@@ -1004,6 +1976,11 @@
          RejectAppend(newData, __func__);
          return;
        }
@@ -997,7 +1195,7 @@
        mProcessedInput += mInputBuffer->Length();
      }
  
-@@ -1205,6 +1987,7 @@
+@@ -1205,6 +2182,7 @@
    // that data has been appended yet ; so we simply append the init segment
    // to the resource.
    mCurrentInputBuffer->AppendData(mParser->InitData());
@@ -1005,7 +1203,7 @@
    CreateDemuxerforMIMEType();
    if (!mInputDemuxer) {
      RejectAppend(NS_ERROR_FAILURE, __func__);
-@@ -1274,6 +2057,7 @@
+@@ -1274,6 +2252,7 @@
      const MediaSpan& aData) {
    MOZ_ASSERT(mCurrentInputBuffer);
    mCurrentInputBuffer->AppendData(aData);
@@ -1013,7 +1211,7 @@
    mInputDemuxer->NotifyDataArrived();
  }
  
-@@ -1301,6 +2085,7 @@
+@@ -1301,6 +2280,7 @@
    // that data has been appended yet ; so we simply append the init segment
    // to the resource.
    mCurrentInputBuffer->AppendData(mParser->InitData());
@@ -1021,7 +1219,7 @@
    uint32_t length = endInit - (mProcessedInput - mInputBuffer->Length());
    MOZ_RELEASE_ASSERT(length <= mInputBuffer->Length());
    mInputBuffer->RemoveFront(length);
-@@ -1703,6 +2488,7 @@
+@@ -1703,6 +2683,7 @@
        // We've completed our earlier media segment and no new data is to be
        // processed. This happens with some containers that can't detect that a
        // media segment is ending until a new one starts.
@@ -1029,7 +1227,7 @@
        RefPtr<CodedFrameProcessingPromise> p =
            mProcessingPromise.Ensure(__func__);
        CompleteCodedFrameProcessing();
-@@ -1710,6 +2496,7 @@
+@@ -1710,6 +2691,7 @@
      }
      AppendDataToCurrentInputBuffer(mInputBuffer->To(length));
      mInputBuffer->RemoveFront(length);
