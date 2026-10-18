@@ -1,6 +1,6 @@
 --- a/docshell/base/BrowsingContext.h
 +++ b/docshell/base/BrowsingContext.h
-@@ -301,7 +301,11 @@
+@@ -301,7 +301,14 @@
    FIELD(IsDocumentPiP, bool)                                                  \
    /* True if this is a content browsing context whose page has an open        \
       Document Picture-in-Picture window */                                    \
@@ -9,26 +9,36 @@
 +  /* Termux (yamsergey.termux.packages patch 0034): while true, the           \
 +     SourceBuffers of every document in this top-level browsing context       \
 +     write the media segments they receive to disk. Parent-process only. */   \
-+  FIELD(TermuxMediaRecording, bool)
++  FIELD(TermuxMediaRecording, bool)                                           \
++  /* Termux patch 0034: while true (and recording), the dump keeps its files  \
++     and counters but leaves out the segments that arrive: a pause. */        \
++  FIELD(TermuxMediaRecordingPaused, bool)
  
  #define NS_DOM_BROWSINGCONTEXT_IID \
    {0x5059a6aa, 0xf09, 0x415c, {0x89, 0xbd, 0x63, 0xfd, 0xe5, 0xab, 0x1a, 0x66}};
-@@ -684,6 +688,9 @@
+@@ -684,6 +691,12 @@
    bool IsActive() const;
    bool ForceOffline() const { return GetForceOffline(); }
  
 +  // Termux patch 0034: read on the top-level browsing context by SourceBuffer.
 +  bool TermuxMediaRecording() const { return GetTermuxMediaRecording(); }
++  bool TermuxMediaRecordingPaused() const {
++    return GetTermuxMediaRecordingPaused();
++  }
 +
    nsILoadInfo::IPAddressSpace GetCurrentIPAddressSpace() const {
      return GetIPAddressSpace();
    }
-@@ -1572,6 +1579,12 @@
+@@ -1572,6 +1585,16 @@
    bool CanSet(FieldIndex<IDX_ForceOffline>, bool aNewValue,
                ContentParent* aSource);
  
 +  // Termux patch 0034: only chrome code in the parent process may toggle it.
 +  bool CanSet(FieldIndex<IDX_TermuxMediaRecording>, const bool&,
++              ContentParent* aSource) {
++    return XRE_IsParentProcess() && !aSource;
++  }
++  bool CanSet(FieldIndex<IDX_TermuxMediaRecordingPaused>, const bool&,
 +              ContentParent* aSource) {
 +    return XRE_IsParentProcess() && !aSource;
 +  }
@@ -38,7 +48,7 @@
      return IsTop();
 --- a/dom/chrome-webidl/BrowsingContext.webidl
 +++ b/dom/chrome-webidl/BrowsingContext.webidl
-@@ -159,6 +159,13 @@
+@@ -159,6 +159,18 @@
    [SetterThrows] attribute boolean forceOffline;
  
    /**
@@ -47,6 +57,11 @@
 +   * disk (pref media.termux.recording.dir). Set it on the top context.
 +   */
 +  [SetterThrows] attribute boolean termuxMediaRecording;
++  /**
++   * Termux (patch 0034): while true during a recording, the segments that
++   * arrive are left out; the files and counters stay (a pause).
++   */
++  [SetterThrows] attribute boolean termuxMediaRecordingPaused;
 +
 +  /**
     * Sets whether this is an app tab. Non-same-origin link navigations from app
@@ -63,7 +78,7 @@
  namespace mozilla {
  
  class AbstractThread;
-@@ -147,6 +149,40 @@
+@@ -147,6 +149,44 @@
  
    // Interface for MediaSourceDemuxer
    MediaInfo GetMetadata() const;
@@ -75,6 +90,10 @@
 +  // thread; the work happens on the task queue.
 +  void SetDump(bool aEnabled, const nsACString& aDir,
 +               const nsACString& aBaseName, const nsACString& aExt);
++  // While paused the dump stays on (files, counters and the recorded
++  // intervals are kept) but the segments that arrive are left out; the
++  // first one after the pause starts a new part. Main thread.
++  void SetDumpPaused(bool aPaused);
 +  struct DumpStats {
 +    bool mEnabled = false;
 +    bool mError = false;
@@ -104,7 +123,7 @@
    const TrackBuffer& GetTrackBuffer(TrackInfo::TrackType aTrack) const;
    const media::TimeIntervals& Buffered(TrackInfo::TrackType) const;
    const media::TimeUnit& HighestStartTime(TrackInfo::TrackType) const;
-@@ -252,6 +288,72 @@
+@@ -252,6 +292,74 @@
    void AppendDataToCurrentInputBuffer(const MediaSpan& aData)
        MOZ_REQUIRES(mTaskQueueCapability);
  
@@ -121,6 +140,7 @@
 +  // fragment.
 +  void DoSetDump(bool aEnabled, const nsCString& aDir,
 +                 const nsCString& aBaseName, const nsCString& aExt);
++  void DoSetDumpPaused(bool aPaused);
 +  // A complete init segment arrived (also used to start mid-stream).
 +  void DumpWriteInit(MediaByteBuffer* aInit);
 +  // Media segment bytes, kept pending until DumpFlushSegment().
@@ -152,6 +172,7 @@
 +  bool mDumpNeedPart = false;
 +  nsTArray<uint8_t> mDumpPending;
 +  bool mDumpAwaitSegment = false;
++  bool mDumpPaused = false;
 +  int64_t mDumpNotedStartUs = -1;
 +  int64_t mDumpNotedEndUs = -1;
 +  // Media range of the last segment written to the open part, -1 = none yet.
@@ -192,7 +213,7 @@
  
  extern mozilla::LogModule* GetMediaSourceLog();
  
-@@ -105,7 +108,977 @@
+@@ -105,7 +108,1006 @@
    DDLINKCHILD("parser", mParser.get());
  }
  
@@ -222,6 +243,26 @@
 +      }));
 +}
 +
++void TrackBuffersManager::SetDumpPaused(bool aPaused) {
++  MOZ_ASSERT(NS_IsMainThread());
++  RefPtr<TaskQueue> taskQueue = GetTaskQueueSafe();
++  if (!taskQueue) {
++    return;
++  }
++  (void)taskQueue->Dispatch(NS_NewRunnableFunction(
++      "TrackBuffersManager::SetDumpPaused",
++      [self = RefPtr<TrackBuffersManager>(this), aPaused]() {
++        self->DoSetDumpPaused(aPaused);
++      }));
++}
++
++void TrackBuffersManager::DoSetDumpPaused(bool aPaused) {
++  if (mDumpEnabled && mDumpPaused != aPaused) {
++    MSE_DEBUG("Dump {}", aPaused ? "paused" : "resumed");
++  }
++  mDumpPaused = aPaused;
++}
++
 +TrackBuffersManager::DumpStats TrackBuffersManager::GetDumpStats() const {
 +  DumpStats stats;
 +  stats.mEnabled = mDumpEnabled;
@@ -248,6 +289,7 @@
 +    mDumpNeedPart = false;
 +    mDumpEnabled = false;
 +    mDumpAwaitSegment = false;
++    mDumpPaused = false;
 +    MSE_DEBUG("Dump off ({} bytes, {} parts)", uint64_t(mDumpBytes),
 +              uint32_t(mDumpParts));
 +    return;
@@ -276,6 +318,7 @@
 +  mDumpPartLastStartUs = -1;
 +  mDumpPartLastEndUs = -1;
 +  mDumpRecorded = media::TimeIntervals();
++  mDumpPaused = false;
 +  DumpDropPending();
 +  // The current init segment is written, and media data copied, from the
 +  // next segment boundary on (SegmentParserLoop).
@@ -1074,6 +1117,13 @@
 +  const size_t length = mDumpPending.Length();
 +  auto dropPending = MakeScopeExit([&] { DumpDropPending(); });
 +
++  // Paused: the segment is left out; the recorded intervals and the part
++  // state stay, so the stream going on after the pause starts a new part
++  // (the gap rule below) and nothing is written twice.
++  if (mDumpPaused) {
++    return;
++  }
++
 +  if (mDumpExt.EqualsLiteral("mp4") &&
 +      SegmentHasEmptySample(mDumpPending.Elements(), length)) {
 +    MSE_DEBUG("Dump: dropping a segment with a zero-size sample");
@@ -1171,7 +1221,7 @@
  
  RefPtr<TrackBuffersManager::AppendPromise> TrackBuffersManager::AppendData(
      already_AddRefed<MediaByteBuffer> aData,
-@@ -249,6 +1222,8 @@
+@@ -249,6 +1251,8 @@
        break;
      case Type::Detach:
        mCurrentInputBuffer = nullptr;
@@ -1180,7 +1230,7 @@
        MOZ_DIAGNOSTIC_ASSERT(mQueue.Length() == 0,
                              "Detach task must be the last");
        mVideoTracks.Reset();
-@@ -511,6 +1486,7 @@
+@@ -511,6 +1515,7 @@
      // The demuxer will be recreated during the next run of SegmentParserLoop.
      // As such we don't need to notify it that data has been removed.
      mCurrentInputBuffer = new SourceBufferResource();
@@ -1188,7 +1238,7 @@
    }
  
    // We could be left with a demuxer in an unusable state. It needs to be
-@@ -967,6 +1943,11 @@
+@@ -967,6 +1972,11 @@
        if (NS_SUCCEEDED(haveMediaSegment)) {
          SetAppendState(AppendState::PARSING_MEDIA_SEGMENT);
          mNewMediaSegmentStarted = true;
@@ -1200,7 +1250,7 @@
          continue;
        }
        // We have neither an init segment nor a media segment.
-@@ -1004,6 +1985,11 @@
+@@ -1004,6 +2014,11 @@
          RejectAppend(newData, __func__);
          return;
        }
@@ -1212,7 +1262,7 @@
        mProcessedInput += mInputBuffer->Length();
      }
  
-@@ -1205,6 +2191,7 @@
+@@ -1205,6 +2220,7 @@
    // that data has been appended yet ; so we simply append the init segment
    // to the resource.
    mCurrentInputBuffer->AppendData(mParser->InitData());
@@ -1220,7 +1270,7 @@
    CreateDemuxerforMIMEType();
    if (!mInputDemuxer) {
      RejectAppend(NS_ERROR_FAILURE, __func__);
-@@ -1274,6 +2261,7 @@
+@@ -1274,6 +2290,7 @@
      const MediaSpan& aData) {
    MOZ_ASSERT(mCurrentInputBuffer);
    mCurrentInputBuffer->AppendData(aData);
@@ -1228,7 +1278,7 @@
    mInputDemuxer->NotifyDataArrived();
  }
  
-@@ -1301,6 +2289,7 @@
+@@ -1301,6 +2318,7 @@
    // that data has been appended yet ; so we simply append the init segment
    // to the resource.
    mCurrentInputBuffer->AppendData(mParser->InitData());
@@ -1236,7 +1286,7 @@
    uint32_t length = endInit - (mProcessedInput - mInputBuffer->Length());
    MOZ_RELEASE_ASSERT(length <= mInputBuffer->Length());
    mInputBuffer->RemoveFront(length);
-@@ -1703,6 +2692,7 @@
+@@ -1703,6 +2721,7 @@
        // We've completed our earlier media segment and no new data is to be
        // processed. This happens with some containers that can't detect that a
        // media segment is ending until a new one starts.
@@ -1244,7 +1294,7 @@
        RefPtr<CodedFrameProcessingPromise> p =
            mProcessingPromise.Ensure(__func__);
        CompleteCodedFrameProcessing();
-@@ -1710,6 +2700,7 @@
+@@ -1710,6 +2729,7 @@
      }
      AppendDataToCurrentInputBuffer(mInputBuffer->To(length));
      mInputBuffer->RemoveFront(length);
@@ -1262,7 +1312,7 @@
  #include "mozilla/dom/SourceBufferBinding.h"
  #include "mozilla/dom/TypedArray.h"
  #include "mozilla/mozalloc.h"
-@@ -172,6 +173,22 @@
+@@ -172,6 +173,23 @@
        const SourceBufferTask::AppendBufferResult& aResult);
    void AppendDataErrored(const MediaResult& aError);
  
@@ -1273,6 +1323,7 @@
 +  void UpdateDumpState();
 +  void ReportDumpState(const char* aState, bool aForce);
 +  bool mDumpRequested = false;
++  bool mDumpPaused = false;
 +  bool mDumpNoDir = false;
 +  uint32_t mDumpId = 0;
 +  nsCString mDumpDir;
@@ -1323,7 +1374,7 @@
    StartUpdating();
  
    mTrackBuffersManager->AppendData(aData.forget(), mCurrentAttributes)
-@@ -644,11 +657,216 @@
+@@ -644,11 +657,226 @@
  
    CheckEndTime();
  
@@ -1374,10 +1425,17 @@
 +  Document* doc = window ? window->GetExtantDoc() : nullptr;
 +  BrowsingContext* bc = doc ? doc->GetBrowsingContext() : nullptr;
 +  bool want = bc && bc->Top() && bc->Top()->TermuxMediaRecording();
++  bool paused = want && bc->Top()->TermuxMediaRecordingPaused();
 +  if (want == mDumpRequested) {
++    if (want && paused != mDumpPaused) {
++      mDumpPaused = paused;
++      mTrackBuffersManager->SetDumpPaused(paused);
++      ReportDumpState(nullptr, true);
++    }
 +    return;
 +  }
 +  mDumpRequested = want;
++  mDumpPaused = paused;
 +  mDumpNoDir = false;
 +  if (!want) {
 +    mTrackBuffersManager->SetDump(false, ""_ns, ""_ns, ""_ns);
@@ -1420,6 +1478,9 @@
 +  mDumpExt = StringEndsWith(mType.Type().AsString(), "/webm"_ns) ? "webm"_ns
 +                                                                  : "mp4"_ns;
 +  mTrackBuffersManager->SetDump(true, mDumpDir, mDumpBaseName, mDumpExt);
++  if (paused) {
++    mTrackBuffersManager->SetDumpPaused(true);
++  }
 +  ReportDumpState(nullptr, true);
 +}
 +

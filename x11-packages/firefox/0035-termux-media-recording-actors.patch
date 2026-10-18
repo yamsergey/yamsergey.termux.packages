@@ -14,7 +14,7 @@
 +]
 --- /dev/null
 +++ b/toolkit/components/termux/TermuxMediaRecording.sys.mjs
-@@ -0,0 +1,1050 @@
+@@ -0,0 +1,1066 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -345,7 +345,7 @@
 +    if (!session || session.status !== "recording") {
 +      return this.getState(browsingContext);
 +    }
-+    this._setFlag(session, false);
++    this._setPaused(session, true);
 +    session.status = "paused";
 +    this._emit("state-changed", session);
 +    return this._stateOf(session);
@@ -356,7 +356,7 @@
 +    if (!session || session.status !== "paused") {
 +      return this.getState(browsingContext);
 +    }
-+    this._setFlag(session, true);
++    this._setPaused(session, false);
 +    session.status = "recording";
 +    this._emit("state-changed", session);
 +    return this._stateOf(session);
@@ -466,10 +466,26 @@
 +  _setFlag(session, value) {
 +    try {
 +      if (!session.browsingContext.isDiscarded) {
++        if (!value) {
++          session.browsingContext.termuxMediaRecordingPaused = false;
++        }
 +        session.browsingContext.termuxMediaRecording = value;
 +      }
 +    } catch (e) {
 +      console.error("TermuxMediaRecording: cannot set the flag", e);
++    }
++  },
++
++  // A pause keeps the dump (its files, counters and recorded intervals) and
++  // only leaves out what arrives meanwhile; the content side then starts a
++  // new part when the stream goes on.
++  _setPaused(session, value) {
++    try {
++      if (!session.browsingContext.isDiscarded) {
++        session.browsingContext.termuxMediaRecordingPaused = value;
++      }
++    } catch (e) {
++      console.error("TermuxMediaRecording: cannot set the pause flag", e);
 +    }
 +  },
 +
