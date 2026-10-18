@@ -46,6 +46,17 @@
    bool CanSet(FieldIndex<IDX_InnerSizeSpoofedForRFP>, const CSSIntSize&,
                ContentParent*) {
      return IsTop();
+@@ -1693,6 +1716,10 @@
+ 
+   void DidSet(FieldIndex<IDX_ForceOffline>, bool aOldValue);
+ 
++  // Termux patch 0034: the tab's documents recompute their visibility state
++  // (Document::ComputeVisibilityState reports them visible while recording).
++  void DidSet(FieldIndex<IDX_TermuxMediaRecording>, bool aOldValue);
++
+   void DidSet(FieldIndex<IDX_IsDocumentPiP>, bool aWasPiP) {
+     if (GetIsDocumentPiP() && !aWasPiP) {
+       SetDisplayMode(DisplayMode::Picture_in_picture, IgnoreErrors());
 --- a/dom/chrome-webidl/BrowsingContext.webidl
 +++ b/dom/chrome-webidl/BrowsingContext.webidl
 @@ -159,6 +159,18 @@
@@ -1601,3 +1612,49 @@
  void SourceBuffer::AppendDataErrored(const MediaResult& aError) {
    MOZ_ASSERT(mUpdating);
    mPendingAppend.Complete();
+--- a/dom/base/Document.cpp
++++ b/dom/base/Document.cpp
+@@ -17569,6 +17569,20 @@
+   //     in some cases.
+   // 3)  Is our outer window background?  If so, we're hidden.
+   // Otherwise, we're visible.
++  //
++  // Termux patch 0034: a document in a tab that is being recorded keeps
++  // seeing itself as visible while its window is in the background, so that
++  // the page's player neither pauses nor lowers the quality for a hidden
++  // page (pref media.termux.recording.keepVisible).
++  if (IsVisible() && mWindow && mWindow->GetOuterWindow() &&
++      mWindow->GetOuterWindow()->IsBackground() &&
++      Preferences::GetBool("media.termux.recording.keepVisible", true)) {
++    if (BrowsingContext* bc = GetBrowsingContext()) {
++      if (bc->Top()->TermuxMediaRecording()) {
++        return dom::VisibilityState::Visible;
++      }
++    }
++  }
+   if (!IsVisible() || !mWindow || !mWindow->GetOuterWindow() ||
+       mWindow->GetOuterWindow()->IsBackground()) {
+     return dom::VisibilityState::Hidden;
+--- a/docshell/base/BrowsingContext.cpp
++++ b/docshell/base/BrowsingContext.cpp
+@@ -4363,6 +4363,20 @@
+   }
+ }
+ 
++// Termux patch 0034: Document::ComputeVisibilityState reports the documents
++// of a recorded tab as visible; when the flag changes they recompute it.
++void BrowsingContext::DidSet(FieldIndex<IDX_TermuxMediaRecording>,
++                             bool aOldValue) {
++  if (GetTermuxMediaRecording() == aOldValue) {
++    return;
++  }
++  PreOrderWalk([](BrowsingContext* aBrowsingContext) {
++    if (Document* doc = aBrowsingContext->GetExtantDocument()) {
++      doc->PostVisibilityUpdateEvent();
++    }
++  });
++}
++
+ void BrowsingContext::DidSet(FieldIndex<IDX_ForceOffline>, bool aOldValue) {
+   const bool newValue = ForceOffline();
+   if (newValue == aOldValue) {

@@ -14,7 +14,7 @@
 +]
 --- /dev/null
 +++ b/toolkit/components/termux/TermuxMediaRecording.sys.mjs
-@@ -0,0 +1,1133 @@
+@@ -0,0 +1,1189 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -46,6 +46,21 @@
 +const PREF_KEEP_PARTS = "media.termux.recording.keepParts";
 +// Rescale H.264 parts of another size than the main rendition in the merge.
 +const PREF_RESCALE = "media.termux.recording.rescaleParts";
++// While a recording runs, Firefox's background throttling is relaxed so that
++// a hidden window keeps streaming at full speed: no decoder suspension,
++// timers at full rate, hidden windows painted at 30 fps, no lowering of the
++// process priority. A pref the user set themselves is left alone; the others
++// are set for the duration and cleared when the last recording stops. The
++// names set are remembered in PREF_APPLIED, so a crash cannot leave them.
++const BACKGROUND_PREFS = [
++  ["media.suspend-background-video.enabled", false],
++  ["dom.timeout.enable_budget_timer_throttling", false],
++  ["dom.min_background_timeout_value", 100],
++  ["dom.min_background_timeout_value_without_budget_throttling", 100],
++  ["layout.throttled_frame_rate", 30],
++  ["dom.ipc.processPriorityManager.enabled", false],
++];
++const PREF_APPLIED = "media.termux.recording.appliedPrefs";
 +
 +class Listeners {
 +  #fns = new Set();
@@ -338,6 +353,7 @@
 +    session.mergeError = null;
 +    session.frozenTracks = null;
 +    this._refreshMeta(session);
++    this._applyBackgroundPrefs();
 +    this._setFlag(session, true);
 +    this._emit("state-changed", session);
 +    return this._stateOf(session);
@@ -380,6 +396,7 @@
 +    }
 +    this._setFlag(session, false);
 +    session.status = "saving";
++    this._restoreBackgroundPrefs();
 +    session.stoppedAt = Date.now();
 +    session.progress = 0;
 +    // What was captured is fixed now; later reports belong to the next one.
@@ -510,6 +527,42 @@
 +    if (changed) {
 +      this._emit("state-changed", session);
 +    }
++  },
++
++  _applyBackgroundPrefs() {
++    const applied = new Set(
++      Services.prefs.getStringPref(PREF_APPLIED, "").split(",").filter(Boolean)
++    );
++    for (const [name, value] of BACKGROUND_PREFS) {
++      if (!applied.has(name) && Services.prefs.prefHasUserValue(name)) {
++        continue;
++      }
++      try {
++        if (typeof value === "boolean") {
++          Services.prefs.setBoolPref(name, value);
++        } else {
++          Services.prefs.setIntPref(name, value);
++        }
++        applied.add(name);
++      } catch (e) {
++        console.warn(`TermuxMediaRecording: cannot set ${name}`, e);
++      }
++    }
++    Services.prefs.setStringPref(PREF_APPLIED, [...applied].join(","));
++  },
++
++  _restoreBackgroundPrefs() {
++    for (const session of this._sessions.values()) {
++      if (session.status === "recording" || session.status === "paused") {
++        return;
++      }
++    }
++    for (const name of Services.prefs.getStringPref(PREF_APPLIED, "").split(",")) {
++      if (name) {
++        Services.prefs.clearUserPref(name);
++      }
++    }
++    Services.prefs.clearUserPref(PREF_APPLIED);
 +  },
 +
 +  _sessionFor(browsingContext, create) {
@@ -1148,6 +1201,9 @@
 +    }
 +  },
 +};
++
++// Prefs a previous run set for a recording and could not clear (a crash).
++TermuxMediaRecording._restoreBackgroundPrefs();
 --- a/toolkit/components/moz.build
 +++ b/toolkit/components/moz.build
 @@ -83,6 +83,7 @@
