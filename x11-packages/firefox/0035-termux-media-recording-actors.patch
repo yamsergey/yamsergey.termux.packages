@@ -14,7 +14,7 @@
 +]
 --- /dev/null
 +++ b/toolkit/components/termux/TermuxMediaRecording.sys.mjs
-@@ -0,0 +1,1233 @@
+@@ -0,0 +1,1283 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -43,6 +43,11 @@
 +
 +const PREF_DIR = "media.termux.recording.dir";
 +const PREF_FFMPEG = "media.termux.recording.ffmpeg";
++
++// Merge progress: the share of the bar for measuring the parts, and the run
++// time of a stream copy relative to the media's duration.
++const MEASURE_SHARE = 0.1;
++const COPY_COST = 0.02;
 +const PREF_KEEP_PARTS = "media.termux.recording.keepParts";
 +// Rescale H.264 parts of another size than the main rendition in the merge.
 +const PREF_RESCALE = "media.termux.recording.rescaleParts";
@@ -126,8 +131,12 @@
 +    this.summaryPath = null;
 +    // The recording's own folder name (PREF_FOLDERS), "" without one.
 +    this.folder = "";
-+    // Merge (status "saving" and after).
++    // Merge (status "saving" and after). stage is {name, index, count,
++    // kind}: measuring | rescaling | joining (kind: the track kind) |
++    // writing, index counted from 1.
 +    this.progress = 0;
++    this.stage = null;
++    this.mergeStartedAt = null;
 +    this.output = null;
 +    this.outputBytes = 0;
 +    this.endedByPage = false;
@@ -380,6 +389,8 @@
 +    session.stoppedAt = null;
 +    session.summaryPath = null;
 +    session.progress = 0;
++    session.stage = null;
++    session.mergeStartedAt = null;
 +    session.output = null;
 +    session.outputBytes = 0;
 +    session.endedByPage = false;
@@ -431,6 +442,8 @@
 +    this._restoreBackgroundPrefs();
 +    session.stoppedAt = Date.now();
 +    session.progress = 0;
++    session.stage = { name: "measuring", index: 0, count: 0 };
++    session.mergeStartedAt = session.stoppedAt;
 +    // What was captured is fixed now; later reports belong to the next one.
 +    session.frozenTracks = new Map(session.tracks);
 +    await this._writeSummary(session, this._stateOf(session));
@@ -746,6 +759,8 @@
 +      tracks,
 +      files,
 +      progress: session.progress,
++      stage: session.stage,
++      mergeStartedAt: session.mergeStartedAt,
 +      output: session.output,
 +      outputBytes: session.outputBytes,
 +      summaryPath: session.summaryPath,
@@ -813,6 +828,8 @@
 +    const startUsByKind = new Map();
 +    const unreadable = [];
 +    let order = 0;
++    const fileCount = state.tracks.reduce((n, t) => n + t.files.length, 0);
++    let measured = 0;
 +    for (const track of state.tracks) {
 +      if (track.startUs >= 0) {
 +        startUsByKind.set(
@@ -821,6 +838,9 @@
 +        );
 +      }
 +      for (const file of track.files) {
++        session.stage = { name: "measuring", index: ++measured, count: fileCount };
++        session.progress = (MEASURE_SHARE * (measured - 1)) / fileCount;
++        this._emit("state-changed", session);
 +        if (!(await IOUtils.exists(file))) {
 +          console.warn(`TermuxMediaRecording: ${file} is missing`);
 +          continue;
@@ -866,15 +886,36 @@
 +    }
 +    const rescale =
 +      !webm && Services.prefs.getBoolPref(PREF_RESCALE, true);
-+    let steps = 1;
-+    for (const [kind, plan] of plans) {
-+      steps += plan.parts.length > 1 ? 1 : 0;
-+      steps += kind === "video" && rescale ? plan.rescale.length : 0;
-+    }
-+    let done = 0;
++    // The rest of the bar is shared by the steps in proportion to their
++    // expected run time: a re-encode runs about as fast as the media plays,
++    // a stream copy many times faster.
++    const rescaleParts = rescale ? plans.get("video")?.rescale || [] : [];
++    const joinKinds = [...plans].filter(([, plan]) => plan.parts.length > 1);
++    const copyWork = parts =>
++      COPY_COST * parts.reduce((sum, part) => sum + part.span, 0) + 1;
++    const muxWork = COPY_COST * (state.capturedMs / 1000) + 1;
++    const totalWork =
++      rescaleParts.reduce((sum, part) => sum + part.span + 1, 0) +
++      joinKinds.reduce((sum, [, plan]) => sum + copyWork(plan.parts), 0) +
++      muxWork;
++    let doneWork = 0;
++    let stepWork = 0;
 +    const report = fraction => {
-+      session.progress = Math.min(0.99, (done + fraction) / steps);
++      const share = (doneWork + fraction * stepWork) / totalWork;
++      session.progress = Math.min(
++        0.99,
++        Math.max(session.progress, MEASURE_SHARE + (1 - MEASURE_SHARE) * share)
++      );
 +      this._emit("state-changed", session);
++    };
++    const begin = (name, index, count, work, kind = undefined) => {
++      session.stage = { name, index, count, kind };
++      stepWork = work;
++      report(0);
++    };
++    const end = () => {
++      doneWork += stepWork;
++      stepWork = 0;
 +    };
 +
 +    // 2. Rescale the parts of another size to the main rendition, so that
@@ -884,7 +925,8 @@
 +    //    part whose encode fails stays as it is.
 +    if (rescale) {
 +      const plan = plans.get("video");
-+      for (const part of plan?.rescale || []) {
++      for (const [i, part] of rescaleParts.entries()) {
++        begin("rescaling", i + 1, rescaleParts.length, part.span + 1);
 +        const target = `${prefix}-video-${String(part.order).padStart(3, "0")}.rescaled.mp4`;
 +        temporaries.push(target);
 +        try {
@@ -899,7 +941,7 @@
 +        } catch (e) {
 +          console.warn(`TermuxMediaRecording: cannot rescale ${part.file}`, e);
 +        }
-+        done++;
++        end();
 +      }
 +    }
 +
@@ -946,13 +988,20 @@
 +        totalMs += span * 1000;
 +      });
 +      await IOUtils.writeUTF8(list, lines.join("\n") + "\n");
++      begin(
++        "joining",
++        joinKinds.findIndex(([k]) => k === kind) + 1,
++        joinKinds.length,
++        copyWork(parts),
++        kind
++      );
 +      await this._runFfmpeg(
 +        ffmpeg,
 +        ["-f", "concat", "-safe", "0", "-i", list, "-c", "copy", merged],
 +        totalMs,
 +        report
 +      );
-+      done++;
++      end();
 +      inputs.push({ path: merged, kind, start });
 +    }
 +
@@ -975,6 +1024,7 @@
 +      args.push("-movflags", "+faststart");
 +    }
 +    args.push(output);
++    begin("writing", 1, 1, muxWork);
 +    await this._runFfmpeg(ffmpeg, args, state.capturedMs, report);
 +
 +    // 5. Tidy up. Parts left out as repeats are deleted with the rest; the
