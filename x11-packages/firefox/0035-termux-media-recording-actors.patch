@@ -14,7 +14,7 @@
 +]
 --- /dev/null
 +++ b/toolkit/components/termux/TermuxMediaRecording.sys.mjs
-@@ -0,0 +1,1603 @@
+@@ -0,0 +1,1647 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -387,6 +387,7 @@
 +   * recording's own folder or, for the flat layout, in the directory itself.
 +   * `path` is the summary's path (where it would be for parts without one)
 +   * and names the recording in mergeSavedRecording and deleteSavedRecording.
++   * `thumbnail` is <name>.jpg, a frame the merge saved, or null.
 +   * A recording running or merging now is listed by listRecordings instead.
 +   */
 +  async listSavedRecordings() {
@@ -621,6 +622,9 @@
 +      error: summary.error ? String(summary.error) : null,
 +      output,
 +      outputBytes,
++      thumbnail: entry.names.includes(`${entry.prefix}.jpg`)
++        ? PathUtils.join(entry.dir, `${entry.prefix}.jpg`)
++        : null,
 +      parts: parts.length,
 +      partBytes,
 +      sizes,
@@ -1363,7 +1367,47 @@
 +    } catch (e) {
 +      // Reported without a size.
 +    }
++    await this._makeThumbnail(ffmpeg, output, state.capturedMs);
 +    this._finishMerge(session, { output, outputBytes });
++  },
++
++  /**
++   * <dir>/<prefix>.jpg next to the merged file: one frame, 320 pixels wide,
++   * a tenth of the way in (at most 10 s), or the first frame of a clip too
++   * short for that. The JPEG encoder takes full-range pixels only, hence the
++   * conversion. A missing thumbnail is no error.
++   */
++  async _makeThumbnail(ffmpeg, output, capturedMs) {
++    const thumbnail = output.replace(/\.[^./]+$/, ".jpg");
++    const at = Math.min(10, (capturedMs / 1000) * 0.1);
++    for (const seek of at > 0.5 ? [at, 0] : [0]) {
++      try {
++        await this._runFfmpeg(
++          ffmpeg,
++          [
++            "-ss",
++            seek.toFixed(2),
++            "-i",
++            output,
++            "-frames:v",
++            "1",
++            "-vf",
++            "scale=320:-2,format=yuvj420p",
++            "-q:v",
++            "5",
++            thumbnail,
++          ],
++          0,
++          () => {}
++        );
++        if ((await IOUtils.stat(thumbnail)).size > 0) {
++          return;
++        }
++      } catch (e) {
++        // No decodable frame there; try the start, or go without.
++      }
++    }
++    await IOUtils.remove(thumbnail, { ignoreAbsent: true }).catch(() => {});
 +  },
 +
 +  /**
