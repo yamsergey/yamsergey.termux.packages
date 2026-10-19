@@ -14,7 +14,7 @@
 +]
 --- /dev/null
 +++ b/toolkit/components/termux/TermuxMediaRecording.sys.mjs
-@@ -0,0 +1,1647 @@
+@@ -0,0 +1,1682 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -48,6 +48,9 @@
 +// time of a stream copy relative to the media's duration.
 +const MEASURE_SHARE = 0.1;
 +const COPY_COST = 0.02;
++// How often a merge cut short by the browser going away (its summary still
++// says "saving") is started again at the next start.
++const MAX_RESUMES = 2;
 +const PREF_KEEP_PARTS = "media.termux.recording.keepParts";
 +// Rescale H.264 parts of another size than the main rendition in the merge.
 +const PREF_RESCALE = "media.termux.recording.rescaleParts";
@@ -151,6 +154,8 @@
 +    // The summary of a saved recording merged again (mergeSavedRecording);
 +    // it stands for the tracks.
 +    this.restored = null;
++    // That merge, settled when it has finished either way.
++    this.merging = null;
 +  }
 +}
 +
@@ -435,7 +440,7 @@
 +    session.mergeStartedAt = Date.now();
 +    this._remerging.set(path, session);
 +    this._emit("state-changed", session);
-+    this._merge(session)
++    session.merging = this._merge(session)
 +      .catch(e => {
 +        console.error("TermuxMediaRecording: merge failed", e);
 +        return this._finishMerge(session, { error: String(e?.message || e) });
@@ -469,6 +474,36 @@
 +  },
 +
 +  // Summary paths of the recordings running or being merged now.
++  /**
++   * Starts again, one after the other, the merges that never finished: the
++   * browser quit (its last window closed), crashed or was killed while it was
++   * merging, leaving a summary that says "saving" next to the parts. Each one
++   * is counted in its summary (`resumes`) and given up after MAX_RESUMES, so
++   * a merge that takes the browser down is not repeated on every start.
++   */
++  async resumeInterruptedMerges() {
++    for (const entry of (await this._scanSaved()).values()) {
++      const { summary } = entry;
++      const resumes = Number(summary.resumes) || 0;
++      if (
++        !entry.saved ||
++        summary.status !== "saving" ||
++        resumes >= MAX_RESUMES ||
++        this._busySummaries().has(entry.path) ||
++        (await this._savedRow(entry)).status !== "unmerged"
++      ) {
++        continue;
++      }
++      try {
++        await IOUtils.writeJSON(entry.path, { ...summary, resumes: resumes + 1 });
++        await this.mergeSavedRecording(entry.path);
++        await this._remerging.get(entry.path)?.merging;
++      } catch (e) {
++        console.error(`TermuxMediaRecording: cannot resume ${entry.path}`, e);
++      }
++    }
++  },
++
 +  _busySummaries() {
 +    const busy = new Set(this._remerging.keys());
 +    for (const session of this._sessions.values()) {

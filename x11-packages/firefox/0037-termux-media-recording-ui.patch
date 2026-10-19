@@ -17,7 +17,7 @@
 +JAR_MANIFESTS += ["jar.mn"]
 --- /dev/null
 +++ b/browser/components/termux/TermuxRecordingUI.sys.mjs
-@@ -0,0 +1,675 @@
+@@ -0,0 +1,686 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -203,6 +203,17 @@
 +    };
 +    lazy.TermuxMediaRecording.on("stream-detected", this._onState);
 +    lazy.TermuxMediaRecording.on("state-changed", this._onState);
++
++    // Merges cut short by the last run of the browser go on, shown like any
++    // other recording being saved.
++    ChromeUtils.idleDispatch(
++      () => {
++        lazy.TermuxMediaRecording.resumeInterruptedMerges().catch(
++          console.error
++        );
++      },
++      { timeout: 10000 }
++    );
 +  },
 +
 +  _onWidgetCreated(node) {
