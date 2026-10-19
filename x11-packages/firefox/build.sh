@@ -4,7 +4,7 @@ TERMUX_PKG_LICENSE="MPL-2.0"
 TERMUX_PKG_MAINTAINER="@termux"
 TERMUX_PKG_VERSION="156.0.1"
 # Wayland build (mozconfig.cfg); the revision tells it apart from the Termux package.
-TERMUX_PKG_REVISION=109
+TERMUX_PKG_REVISION=110
 TERMUX_PKG_SRCURL="https://archive.mozilla.org/pub/firefox/releases/${TERMUX_PKG_VERSION#*really}/source/firefox-${TERMUX_PKG_VERSION#*really}.source.tar.xz"
 TERMUX_PKG_SHA256=f8b0bf733efebebf9af98ead537598c2cf56c2c1b9c06bf89220ea6731b64724
 # ffmpeg and pulseaudio are dependencies through dlopen(3):
