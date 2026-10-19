@@ -14,7 +14,7 @@
 +]
 --- /dev/null
 +++ b/toolkit/components/termux/TermuxMediaRecording.sys.mjs
-@@ -0,0 +1,1283 @@
+@@ -0,0 +1,1603 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -115,9 +115,10 @@
 + * Everything known about the media in one top-level browsing context.
 + */
 +class Session {
++  // topBrowsingContext is null for a saved recording merged again.
 +  constructor(topBrowsingContext) {
 +    this.browsingContext = topBrowsingContext;
-+    this.browsingContextId = topBrowsingContext.id;
++    this.browsingContextId = topBrowsingContext?.id ?? 0;
 +    // `${innerWindowId}:${trackId}` -> last report from the content process.
 +    this.tracks = new Map();
 +    // idle | recording | paused | saving | ready | partial | error
@@ -131,6 +132,9 @@
 +    this.summaryPath = null;
 +    // The recording's own folder name (PREF_FOLDERS), "" without one.
 +    this.folder = "";
++    // The name of the file and the summary when it is known up front (a
++    // saved recording merged again); otherwise _prefixOf works it out.
++    this.prefix = "";
 +    // Merge (status "saving" and after). stage is {name, index, count,
 +    // kind}: measuring | rescaling | joining (kind: the track kind) |
 +    // writing, index counted from 1.
@@ -144,7 +148,52 @@
 +    // Reports from the content side after a stop are not part of this
 +    // recording any more.
 +    this.frozenTracks = null;
++    // The summary of a saved recording merged again (mergeSavedRecording);
++    // it stands for the tracks.
++    this.restored = null;
 +  }
++}
++
++// A part as the dump names it: <prefix>-<kind>-<track id>-p<NNN>.<ext>.
++const PART_NAME = /^(.+)-(video|audio)-(\d+)-p(\d{3,})\.(mp4|webm)$/;
++
++/**
++ * A summary for parts that were never merged (the merge was interrupted, or
++ * the recording predates the summaries): one track per kind and track id.
++ */
++function summaryOfParts(prefix, dir, names) {
++  const tracks = new Map();
++  for (const name of names.sort()) {
++    const match = PART_NAME.exec(name);
++    if (!match) {
++      continue;
++    }
++    const key = `${match[2]}-${match[3]}`;
++    if (!tracks.has(key)) {
++      tracks.set(key, { kind: match[2], startUs: -1, files: [] });
++    }
++    tracks.get(key).files.push(PathUtils.join(dir, name));
++  }
++  // The parts' own prefix is <seconds>-<host>; a recording's folder is
++  // named "<date>_<time> <title>".
++  const first = PART_NAME.exec(names.find(n => PART_NAME.test(n)) || "");
++  const stamp = /^(\d{9,11})-(.+)$/.exec(first ? first[1] : prefix);
++  const folder = /^\d{4}-\d\d-\d\d_\d\d-\d\d-\d\d (.+)$/.exec(prefix);
++  return {
++    status: "saving",
++    title: folder ? folder[1] : "",
++    url: "",
++    origin: stamp ? stamp[2] : "",
++    startedAt: stamp ? Number(stamp[1]) * 1000 : null,
++    stoppedAt: null,
++    capturedMs: 0,
++    encrypted: false,
++    error: null,
++    output: null,
++    outputBytes: 0,
++    tracks: [...tracks.values()],
++    files: [...tracks.values()].flatMap(t => t.files),
++  };
 +}
 +
 +function fileName(track, part) {
@@ -284,6 +333,8 @@
 +export const TermuxMediaRecording = {
 +  _sessions: new Map(),
 +  _history: [],
++  // Saved recordings merged again: summary path -> Session.
++  _remerging: new Map(),
 +  _listeners: new Map([
 +    ["stream-detected", new Listeners()],
 +    ["state-changed", new Listeners()],
@@ -324,7 +375,256 @@
 +        live.push(this._stateOf(session));
 +      }
 +    }
++    for (const session of this._remerging.values()) {
++      live.push(this._stateOf(session));
++    }
 +    return [...this._history, ...live];
++  },
++
++  /**
++   * The recordings found in the recording directory, newest first: one per
++   * summary (<name>.json) and one per group of parts without a summary, in a
++   * recording's own folder or, for the flat layout, in the directory itself.
++   * `path` is the summary's path (where it would be for parts without one)
++   * and names the recording in mergeSavedRecording and deleteSavedRecording.
++   * A recording running or merging now is listed by listRecordings instead.
++   */
++  async listSavedRecordings() {
++    const busy = this._busySummaries();
++    const rows = [];
++    for (const entry of (await this._scanSaved()).values()) {
++      if (busy.has(entry.path)) {
++        continue;
++      }
++      rows.push(await this._savedRow(entry));
++    }
++    rows.sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
++    return rows;
++  },
++
++  /**
++   * Merges the parts of a saved recording that has no file yet (or whose
++   * merge failed). Returns at once, like stop(); "state-changed" reports the
++   * progress with the recording's summaryPath.
++   */
++  async mergeSavedRecording(path) {
++    const entry = (await this._scanSaved()).get(path);
++    if (!entry) {
++      throw new Error("no such recording");
++    }
++    if (this._busySummaries().has(path)) {
++      throw new Error("the recording is being saved");
++    }
++    const { summary } = entry;
++    const session = new Session(null);
++    session.restored = summary;
++    session.browsingContextId = summary.browsingContextId ?? 0;
++    session.status = "saving";
++    session.title = summary.title || "";
++    session.url = summary.url || "";
++    session.origin = summary.origin || "";
++    session.startedAt = summary.startedAt ?? null;
++    session.stoppedAt = summary.stoppedAt ?? null;
++    session.endedByPage = !!summary.endedByPage;
++    session.dir = entry.dir;
++    session.folder = entry.folder ? PathUtils.filename(entry.folder) : "";
++    session.prefix = entry.prefix;
++    session.summaryPath = path;
++    session.stage = { name: "measuring", index: 0, count: 0 };
++    session.mergeStartedAt = Date.now();
++    this._remerging.set(path, session);
++    this._emit("state-changed", session);
++    this._merge(session)
++      .catch(e => {
++        console.error("TermuxMediaRecording: merge failed", e);
++        return this._finishMerge(session, { error: String(e?.message || e) });
++      })
++      .finally(() => this._remerging.delete(path));
++    return this._stateOf(session);
++  },
++
++  /**
++   * Deletes a saved recording: its folder, or in the flat layout the files
++   * that carry its name (the file, the summary, the parts and the merge's
++   * working files).
++   */
++  async deleteSavedRecording(path) {
++    const entry = (await this._scanSaved()).get(path);
++    if (!entry) {
++      throw new Error("no such recording");
++    }
++    if (this._busySummaries().has(path)) {
++      throw new Error("the recording is being saved");
++    }
++    if (entry.folder) {
++      await IOUtils.remove(entry.folder, { recursive: true });
++      return;
++    }
++    for (const name of entry.names) {
++      await IOUtils.remove(PathUtils.join(entry.dir, name), {
++        ignoreAbsent: true,
++      });
++    }
++  },
++
++  // Summary paths of the recordings running or being merged now.
++  _busySummaries() {
++    const busy = new Set(this._remerging.keys());
++    for (const session of this._sessions.values()) {
++      if (
++        session.status === "recording" ||
++        session.status === "paused" ||
++        session.status === "saving"
++      ) {
++        busy.add(`${session.dir}/${this._prefixOf(session)}.json`);
++      }
++    }
++    return busy;
++  },
++
++  /**
++   * path -> {path, dir, folder, prefix, names, summary, saved} for the
++   * recording directory: its own folders (one recording each) and the flat
++   * layout's files grouped by name.
++   */
++  async _scanSaved() {
++    const root = Services.prefs.getStringPref(PREF_DIR, "").replace(/\/+$/, "");
++    const entries = new Map();
++    if (!root) {
++      return entries;
++    }
++    const list = async dir => {
++      try {
++        const names = [];
++        for (const child of await IOUtils.getChildren(dir)) {
++          const info = await IOUtils.stat(child);
++          names.push({ name: PathUtils.filename(child), type: info.type });
++        }
++        return names;
++      } catch (e) {
++        return [];
++      }
++    };
++    const add = async (dir, folder, prefix, names) => {
++      const path = PathUtils.join(dir, `${prefix}.json`);
++      let summary = null;
++      if (names.includes(`${prefix}.json`)) {
++        try {
++          summary = await IOUtils.readJSON(path);
++        } catch (e) {
++          console.warn(`TermuxMediaRecording: cannot read ${path}`, e);
++        }
++      }
++      const saved = !!summary;
++      if (!summary) {
++        summary = summaryOfParts(prefix, dir, names);
++        if (!summary.files.length) {
++          return;
++        }
++      }
++      entries.set(path, { path, dir, folder, prefix, names, summary, saved });
++    };
++
++    const top = await list(root);
++    const flat = top.filter(c => c.type === "regular").map(c => c.name);
++    for (const child of top) {
++      if (child.type !== "directory") {
++        continue;
++      }
++      // A recording's own folder holds <folder>.json once merged; before
++      // that only its parts.
++      const folder = PathUtils.join(root, child.name);
++      const names = (await list(folder))
++        .filter(c => c.type === "regular")
++        .map(c => c.name);
++      if (names.includes(`${child.name}.json`) || names.some(n => PART_NAME.test(n))) {
++        await add(folder, folder, child.name, names);
++      }
++    }
++    // The flat layout: <prefix>.json, <prefix>.<ext>, <prefix>-<kind>-...
++    const prefixes = new Set();
++    for (const name of flat) {
++      const part = PART_NAME.exec(name);
++      if (part) {
++        prefixes.add(part[1]);
++      } else if (name.endsWith(".json")) {
++        prefixes.add(name.slice(0, -".json".length));
++      }
++    }
++    for (const prefix of prefixes) {
++      const names = flat.filter(
++        n => n.startsWith(`${prefix}.`) || n.startsWith(`${prefix}-`)
++      );
++      await add(root, null, prefix, names);
++    }
++    return entries;
++  },
++
++  /** What listSavedRecordings reports for one recording. */
++  async _savedRow(entry) {
++    const { summary } = entry;
++    const inside = file =>
++      typeof file === "string" && PathUtils.parent(file) === entry.dir;
++    let output = null;
++    let outputBytes = 0;
++    if (inside(summary.output)) {
++      try {
++        outputBytes = (await IOUtils.stat(summary.output)).size;
++        output = summary.output;
++      } catch (e) {
++        // Deleted or moved.
++      }
++    }
++    const parts = [];
++    let partBytes = 0;
++    for (const file of Array.isArray(summary.files) ? summary.files : []) {
++      if (!inside(file)) {
++        continue;
++      }
++      try {
++        partBytes += (await IOUtils.stat(file)).size;
++        parts.push(file);
++      } catch (e) {
++        // Removed by the merge.
++      }
++    }
++    const tracks = Array.isArray(summary.tracks) ? summary.tracks : [];
++    const sizes = [
++      ...new Set(
++        tracks
++          .filter(t => t.kind === "video" && t.width && t.height)
++          .map(t => `${t.width}x${t.height}`)
++      ),
++    ];
++    let status;
++    if (output) {
++      status = summary.status === "partial" ? "partial" : "ready";
++    } else if (parts.length) {
++      // Never merged: stopped by a closing browser, or the merge failed.
++      status = "unmerged";
++    } else {
++      status = "error";
++    }
++    return {
++      path: entry.path,
++      dir: entry.dir,
++      folder: entry.folder,
++      hasSummary: entry.saved,
++      status,
++      title: String(summary.title || ""),
++      url: String(summary.url || ""),
++      origin: String(summary.origin || ""),
++      startedAt: Number(summary.startedAt) || null,
++      stoppedAt: Number(summary.stoppedAt) || null,
++      capturedMs: Number(summary.capturedMs) || 0,
++      encrypted: !!summary.encrypted,
++      error: summary.error ? String(summary.error) : null,
++      output,
++      outputBytes,
++      parts: parts.length,
++      partBytes,
++      sizes,
++    };
 +  },
 +
 +  async start(browsingContext) {
@@ -684,6 +984,23 @@
 +  },
 +
 +  _stateOf(session) {
++    if (session.restored) {
++      return {
++        ...session.restored,
++        browsingContext: null,
++        browsingContextId: session.browsingContextId,
++        status: session.status,
++        endedByPage: session.endedByPage,
++        dir: session.dir,
++        error: session.mergeError,
++        progress: session.progress,
++        stage: session.stage,
++        mergeStartedAt: session.mergeStartedAt,
++        output: session.output,
++        outputBytes: session.outputBytes,
++        summaryPath: session.summaryPath,
++      };
++    }
 +    const tracks = [];
 +    let bytes = 0;
 +    let parts = 0;
@@ -768,6 +1085,9 @@
 +  },
 +
 +  _prefixOf(session) {
++    if (session.prefix) {
++      return session.prefix;
++    }
 +    if (session.folder) {
 +      // <folder>/<folder>.mp4 and .json: the name survives a copy elsewhere.
 +      return session.folder;

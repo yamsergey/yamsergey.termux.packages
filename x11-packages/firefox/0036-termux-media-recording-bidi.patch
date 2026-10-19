@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/remote/webdriver-bidi/modules/root/termux.sys.mjs
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,250 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -26,13 +26,17 @@
 + *   termux.setMediaRecording      {context, action} -> state
 + *   termux.getMediaRecordingState {context}         -> state
 + *   termux.listRecordings         {}                -> {recordings}
++ *   termux.listSavedRecordings    {}                -> {recordings}
++ *   termux.mergeSavedRecording    {path}            -> state
++ *   termux.deleteSavedRecording   {path}            -> {}
 + *
 + * Events
 + *   termux.mediaStreamDetected         a tab gained its first MSE track
 + *   termux.mediaRecordingStateChanged  any later change
 + *
 + * `state` is TermuxMediaRecording's state with `context` (the navigable id)
-+ * in place of the browsing context.
++ * in place of the browsing context. The saved recordings are the ones found
++ * in the recording directory; `path` (their summary's path) names one.
 + */
 +class TermuxModule extends RootBiDiModule {
 +  #subscribedEvents;
@@ -105,6 +109,33 @@
 +        this.#serialize(state)
 +      ),
 +    };
++  }
++
++  async listSavedRecordings() {
++    return {
++      recordings: await lazy.TermuxMediaRecording.listSavedRecordings(),
++    };
++  }
++
++  async mergeSavedRecording(options = {}) {
++    const { path } = options;
++    lazy.assert.string(
++      path,
++      lazy.pprint`Expected "path" to be a string, got ${path}`
++    );
++    return this.#serialize(
++      await lazy.TermuxMediaRecording.mergeSavedRecording(path)
++    );
++  }
++
++  async deleteSavedRecording(options = {}) {
++    const { path } = options;
++    lazy.assert.string(
++      path,
++      lazy.pprint`Expected "path" to be a string, got ${path}`
++    );
++    await lazy.TermuxMediaRecording.deleteSavedRecording(path);
++    return {};
 +  }
 +
 +  #serialize(state, contextId = null) {

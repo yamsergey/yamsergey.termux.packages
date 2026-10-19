@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/browser/components/termux/moz.build
-@@ -0,0 +1,11 @@
+@@ -0,0 +1,14 @@
 +# -*- Mode: python; indent-tabs-mode: nil; tab-width: 40 -*-
 +# vim: set filetype=python:
 +# This Source Code Form is subject to the terms of the Mozilla Public
@@ -12,9 +12,12 @@
 +MOZ_SRC_FILES += [
 +    "TermuxRecordingUI.sys.mjs",
 +]
++
++# about:recordings
++JAR_MANIFESTS += ["jar.mn"]
 --- /dev/null
 +++ b/browser/components/termux/TermuxRecordingUI.sys.mjs
-@@ -0,0 +1,664 @@
+@@ -0,0 +1,675 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -96,7 +99,7 @@
 +}
 +
 +// What the merge is doing now, from the state's stage.
-+function describeStage(stage) {
++export function describeStage(stage) {
 +  const of = stage && stage.count > 1 ? ` ${stage.index} of ${stage.count}` : "";
 +  switch (stage?.name) {
 +    case "measuring":
@@ -120,7 +123,7 @@
 +  return `${state.browsingContextId}:${state.startedAt}`;
 +}
 +
-+function formatTime(ms) {
++export function formatTime(ms) {
 +  const total = Math.max(0, Math.round(ms / 1000));
 +  const h = Math.floor(total / 3600);
 +  const m = Math.floor((total % 3600) / 60);
@@ -130,7 +133,7 @@
 +  return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
 +}
 +
-+function formatBytes(bytes) {
++export function formatBytes(bytes) {
 +  if (bytes >= 1024 * 1024 * 1024) {
 +    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 +  }
@@ -632,9 +635,20 @@
 +    const buttons = this._el(
 +      doc,
 +      "div",
-+      "display: flex; gap: 8px; justify-content: flex-end; padding-top: 2px;"
++      "display: flex; gap: 8px; justify-content: flex-end; align-items: center; padding-top: 2px;"
 +    );
 +    const close = () => panel.hidePopup();
++    const library = this._el(
++      doc,
++      "a",
++      `margin-inline-end: auto; font-size: 12px; color: ${ACCENT}; cursor: pointer; text-decoration: underline;`,
++      "All recordings"
++    );
++    library.addEventListener("click", () => {
++      close();
++      win.switchToTabHavingURI("about:recordings", true);
++    });
++    buttons.appendChild(library);
 +    const recorder = lazy.TermuxMediaRecording;
 +    if (status === "saving") {
 +      buttons.appendChild(this._button(doc, "Close", true, close));
@@ -714,3 +728,498 @@
      // A channel for "remote troubleshooting" code...
      let channel = new lazy.WebChannel(
        "remote-troubleshooting",
+--- /dev/null
++++ b/browser/components/termux/jar.mn
+@@ -0,0 +1,8 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++browser.jar:
++    content/browser/termux/recordings.html (content/recordings.html)
++    content/browser/termux/recordings.css (content/recordings.css)
++    content/browser/termux/recordings.mjs (content/recordings.mjs)
+--- /dev/null
++++ b/browser/components/termux/content/recordings.html
+@@ -0,0 +1,40 @@
++<!DOCTYPE html>
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++<html>
++  <head>
++    <meta charset="utf-8" />
++    <meta
++      http-equiv="Content-Security-Policy"
++      content="default-src chrome:; object-src 'none'"
++    />
++    <meta name="color-scheme" content="light dark" />
++    <title>Recordings</title>
++    <link rel="stylesheet" href="chrome://global/skin/in-content/common.css" />
++    <link rel="stylesheet" href="chrome://browser/content/termux/recordings.css" />
++    <script type="module" src="chrome://browser/content/termux/recordings.mjs"></script>
++  </head>
++  <body>
++    <main>
++      <header>
++        <div class="heading">
++          <h1>Recordings</h1>
++          <p id="summary" class="muted"></p>
++        </div>
++        <button id="open-folder">Open folder</button>
++      </header>
++      <ul id="live" class="list" hidden></ul>
++      <ul id="saved" class="list"></ul>
++      <p id="empty" class="muted" hidden>
++        No recordings yet. On a page with a streamed video, the record button
++        appears in the toolbar.
++      </p>
++      <p class="muted note">
++        A recording is kept as its original parts until they are merged into
++        one file, so nothing is lost if Firefox closes mid-way. Parts that
++        were never merged are listed with a Merge button.
++      </p>
++    </main>
++  </body>
++</html>
+--- /dev/null
++++ b/browser/components/termux/content/recordings.css
+@@ -0,0 +1,154 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++main {
++  max-width: 960px;
++  margin: 0 auto;
++  padding: 32px 16px;
++  display: flex;
++  flex-direction: column;
++  gap: 16px;
++}
++
++header {
++  display: flex;
++  align-items: flex-end;
++  justify-content: space-between;
++  gap: 16px;
++  flex-wrap: wrap;
++}
++
++h1 {
++  margin: 0;
++}
++
++.heading p {
++  margin: 4px 0 0;
++}
++
++.muted {
++  color: var(--text-color-deemphasized);
++  font-size: 0.9em;
++}
++
++.note {
++  margin: 0;
++  line-height: 1.5;
++}
++
++.list {
++  list-style: none;
++  margin: 0;
++  padding: 0;
++  display: flex;
++  flex-direction: column;
++  gap: 8px;
++}
++
++.row {
++  display: flex;
++  align-items: center;
++  gap: 16px;
++  padding: 12px 16px;
++  border-radius: var(--border-radius-medium, 8px);
++  background: var(--background-color-box);
++  border: 1px solid var(--border-color);
++  flex-wrap: wrap;
++}
++
++.tile {
++  width: 96px;
++  height: 54px;
++  border-radius: var(--border-radius-small, 4px);
++  background: color-mix(in srgb, currentColor 12%, transparent);
++  display: flex;
++  align-items: flex-end;
++  justify-content: flex-end;
++  padding: 4px 6px;
++  box-sizing: border-box;
++  flex-shrink: 0;
++  font-variant-numeric: tabular-nums;
++  font-size: 0.8em;
++  font-weight: 600;
++}
++
++.row.live .tile {
++  background: color-mix(in srgb, var(--color-accent-primary) 20%, transparent);
++}
++
++.text {
++  display: flex;
++  flex-direction: column;
++  gap: 3px;
++  flex: 1;
++  min-width: 180px;
++}
++
++.title {
++  font-weight: 600;
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.state {
++  display: flex;
++  flex-direction: column;
++  gap: 6px;
++  width: 200px;
++  font-size: 0.9em;
++}
++
++.state.error {
++  color: var(--text-color-error);
++}
++
++.state .line {
++  display: flex;
++  justify-content: space-between;
++  gap: 8px;
++}
++
++.state .percent {
++  font-weight: 600;
++  font-variant-numeric: tabular-nums;
++}
++
++.bar {
++  height: 4px;
++  border-radius: 2px;
++  overflow: hidden;
++  background: color-mix(in srgb, currentColor 15%, transparent);
++}
++
++.bar > div {
++  height: 4px;
++  border-radius: 2px;
++  background: var(--color-accent-primary);
++}
++
++.size {
++  width: 140px;
++  text-align: end;
++  font-variant-numeric: tabular-nums;
++  font-size: 0.9em;
++}
++
++.actions {
++  display: flex;
++  gap: 6px;
++  flex-wrap: wrap;
++}
++
++.actions button {
++  margin: 0;
++}
++
++@media (max-width: 640px) {
++  .state,
++  .size {
++    width: auto;
++    text-align: start;
++  }
++}
+--- /dev/null
++++ b/browser/components/termux/content/recordings.mjs
+@@ -0,0 +1,258 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++// about:recordings: the recordings in the recording directory, and the ones
++// running or being merged now. Runs with chrome privileges; every text that
++// comes from a recorded page (its title, its address) is set as text only.
++
++const { TermuxMediaRecording } = ChromeUtils.importESModule(
++  "moz-src:///toolkit/components/termux/TermuxMediaRecording.sys.mjs"
++);
++const { describeStage, formatBytes, formatTime } = ChromeUtils.importESModule(
++  "moz-src:///browser/components/termux/TermuxRecordingUI.sys.mjs"
++);
++
++const LIVE = new Set(["recording", "paused", "saving"]);
++
++function el(tag, className, text) {
++  const node = document.createElement(tag);
++  if (className) {
++    node.className = className;
++  }
++  if (text !== undefined) {
++    node.textContent = text;
++  }
++  return node;
++}
++
++function button(label, onClick, primary = false) {
++  const node = el("button", primary ? "primary" : "", label);
++  node.addEventListener("click", onClick);
++  return node;
++}
++
++function bar(progress) {
++  const outer = el("div", "bar");
++  const inner = el("div");
++  inner.style.width = `${Math.round(progress * 100)}%`;
++  outer.appendChild(inner);
++  return outer;
++}
++
++function formatDate(ms) {
++  if (!ms) {
++    return "";
++  }
++  const date = new Date(ms);
++  const time = date.toLocaleTimeString(undefined, {
++    hour: "2-digit",
++    minute: "2-digit",
++  });
++  const today = new Date();
++  const yesterday = new Date(today);
++  yesterday.setDate(today.getDate() - 1);
++  if (date.toDateString() === today.toDateString()) {
++    return `today, ${time}`;
++  }
++  if (date.toDateString() === yesterday.toDateString()) {
++    return `yesterday, ${time}`;
++  }
++  return `${date.toLocaleDateString(undefined, { day: "numeric", month: "short" })}, ${time}`;
++}
++
++function describeSizes(sizes) {
++  const heights = [
++    ...new Set(sizes.map(size => Number(size.split("x")[1])).filter(Boolean)),
++  ].sort((a, b) => b - a);
++  return heights.map(h => `${h}p`).join(" and ");
++}
++
++function open(path) {
++  window.browsingContext.topChromeWindow.openTrustedLinkIn(
++    PathUtils.toFileURI(path),
++    "tab"
++  );
++}
++
++function rowFrame(item, live) {
++  const row = el("li", live ? "row live" : "row");
++  row.appendChild(el("div", "tile", item.capturedMs ? formatTime(item.capturedMs) : ""));
++  const text = el("div", "text");
++  text.appendChild(
++    el("span", "title", item.title || item.origin || "Recording")
++  );
++  text.appendChild(
++    el(
++      "span",
++      "muted",
++      [item.origin, formatDate(item.startedAt), describeSizes(item.sizes || [])]
++        .filter(Boolean)
++        .join(" · ")
++    )
++  );
++  row.appendChild(text);
++  return row;
++}
++
++function liveRow(state) {
++  const sizes = (state.tracks || [])
++    .filter(t => t.kind === "video" && t.width && t.height)
++    .map(t => `${t.width}x${t.height}`);
++  const row = rowFrame({ ...state, sizes }, true);
++  const status = el("div", "state");
++  if (state.status === "saving") {
++    const line = el("div", "line");
++    line.appendChild(el("span", "", describeStage(state.stage)));
++    line.appendChild(
++      el("span", "percent", `${Math.round(state.progress * 100)}%`)
++    );
++    status.appendChild(line);
++    status.appendChild(bar(state.progress));
++  } else {
++    status.appendChild(
++      el(
++        "span",
++        "",
++        state.status === "paused"
++          ? "Paused"
++          : `Recording · ${formatTime(state.capturedMs)}`
++      )
++    );
++  }
++  row.appendChild(status);
++  row.appendChild(el("span", "size", formatBytes(state.bytes || 0)));
++  return row;
++}
++
++function savedRow(item) {
++  const row = rowFrame(item, false);
++  const status = el("div", "state");
++  let label;
++  if (item.encrypted) {
++    label = "Encrypted · won't play";
++  } else if (item.status === "ready") {
++    label = `Ready · ${item.output.endsWith(".webm") ? "WebM" : "MP4"}`;
++  } else if (item.status === "partial") {
++    label = "Partial · the page closed early";
++  } else if (item.status === "unmerged") {
++    label = `Not merged · ${item.parts} part${item.parts === 1 ? "" : "s"}`;
++  } else {
++    label = item.error ? `Failed: ${item.error}` : "Failed";
++    status.classList.add("error");
++  }
++  status.appendChild(el("span", "", label));
++  row.appendChild(status);
++  row.appendChild(
++    el("span", "size", formatBytes(item.outputBytes || item.partBytes || 0))
++  );
++
++  const actions = el("div", "actions");
++  if (item.output) {
++    actions.appendChild(button("Play", () => open(item.output), true));
++  }
++  if (item.parts && !item.output) {
++    actions.appendChild(
++      button(
++        "Merge",
++        () => {
++          TermuxMediaRecording.mergeSavedRecording(item.path)
++            .catch(e => alert(`Cannot merge: ${e.message}`))
++            .finally(refresh);
++        },
++        true
++      )
++    );
++  }
++  actions.appendChild(button("Folder", () => open(item.folder || item.dir)));
++  actions.appendChild(
++    button("Delete", () => {
++      const name = item.title || item.origin || "this recording";
++      const what = item.folder ? "Its folder" : "Its file, summary and parts";
++      if (!confirm(`Delete “${name}”? ${what} will be removed.`)) {
++        return;
++      }
++      TermuxMediaRecording.deleteSavedRecording(item.path)
++        .catch(e => alert(`Cannot delete: ${e.message}`))
++        .finally(refresh);
++    })
++  );
++  row.appendChild(actions);
++  return row;
++}
++
++let saved = [];
++let liveKeys = null;
++let scanning = null;
++
++function liveStates() {
++  return TermuxMediaRecording.listRecordings().filter(state =>
++    LIVE.has(state.status)
++  );
++}
++
++function render() {
++  const live = liveStates();
++  const liveList = document.getElementById("live");
++  liveList.replaceChildren(...live.map(liveRow));
++  liveList.hidden = !live.length;
++  const savedList = document.getElementById("saved");
++  savedList.replaceChildren(...saved.map(savedRow));
++  document.getElementById("empty").hidden = !!(live.length || saved.length);
++
++  const dir = Services.prefs.getStringPref("media.termux.recording.dir", "");
++  const total = saved.reduce(
++    (sum, item) => sum + (item.outputBytes || item.partBytes || 0),
++    0
++  );
++  document.getElementById("summary").textContent = dir
++    ? `Files in ${dir} · ${saved.length} recording${saved.length === 1 ? "" : "s"} · ${formatBytes(total)}`
++    : "media.termux.recording.dir is not set";
++  document.getElementById("open-folder").hidden = !dir;
++}
++
++// Reads the directory again (after a merge, a deletion, or a return to the
++// tab); the live rows are drawn from the recorder's events in between.
++function refresh() {
++  if (!scanning) {
++    scanning = TermuxMediaRecording.listSavedRecordings()
++      .then(rows => {
++        saved = rows;
++      })
++      .catch(console.error)
++      .finally(() => {
++        scanning = null;
++        render();
++      });
++  }
++  return scanning;
++}
++
++function onState() {
++  const keys = liveStates()
++    .map(state => `${state.browsingContextId}:${state.startedAt}:${state.status}`)
++    .join(",");
++  if (keys !== liveKeys) {
++    // A recording started, stopped or finished merging.
++    liveKeys = keys;
++    refresh();
++  } else {
++    render();
++  }
++}
++
++document.addEventListener("DOMContentLoaded", () => {
++  document.getElementById("open-folder").addEventListener("click", () => {
++    open(Services.prefs.getStringPref("media.termux.recording.dir", ""));
++  });
++  TermuxMediaRecording.on("state-changed", onState);
++  window.addEventListener("unload", () =>
++    TermuxMediaRecording.off("state-changed", onState)
++  );
++  document.addEventListener("visibilitychange", () => {
++    if (document.visibilityState === "visible") {
++      refresh();
++    }
++  });
++  onState();
++});
+--- a/browser/components/about/AboutRedirector.cpp
++++ b/browser/components/about/AboutRedirector.cpp
+@@ -114,6 +114,10 @@
+          nsIAboutModule::URI_MUST_LOAD_IN_CHILD | nsIAboutModule::ALLOW_SCRIPT |
+          nsIAboutModule::URI_CAN_LOAD_IN_PRIVILEGEDABOUT_PROCESS |
+          nsIAboutModule::IS_SECURE_CHROME_UI},
++    // Termux media recordings (yamsergey.termux.packages patch 0037): reads
++    // and deletes files in the recording directory, so it runs in the parent.
++    {"recordings", "chrome://browser/content/termux/recordings.html",
++     nsIAboutModule::ALLOW_SCRIPT | nsIAboutModule::IS_SECURE_CHROME_UI},
+     {"reader", "chrome://global/content/reader/aboutReader.html",
+      nsIAboutModule::URI_SAFE_FOR_UNTRUSTED_CONTENT |
+          nsIAboutModule::ALLOW_SCRIPT | nsIAboutModule::URI_MUST_LOAD_IN_CHILD |
+--- a/browser/components/about/components.conf
++++ b/browser/components/about/components.conf
+@@ -21,6 +21,7 @@
+     'protections',
+     'profiling',
+     'reader',
++    'recordings',
+     'referrals',
+     'restartrequired',
+     'rights',
