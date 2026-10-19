@@ -14,3 +14,6 @@ pref("media.termux.recording.rescaleParts", true);
 // while its window is in the background, so that the page's player neither
 // pauses nor lowers the quality for a hidden page.
 pref("media.termux.recording.keepVisible", true);
+// One folder per recording, "<start time> <tab title>", holding its parts
+// while it runs and the merged file and summary afterwards.
+pref("media.termux.recording.folderPerRecording", true);

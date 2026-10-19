@@ -1,6 +1,6 @@
 --- a/docshell/base/BrowsingContext.h
 +++ b/docshell/base/BrowsingContext.h
-@@ -301,7 +301,14 @@
+@@ -301,7 +301,17 @@
    FIELD(IsDocumentPiP, bool)                                                  \
    /* True if this is a content browsing context whose page has an open        \
       Document Picture-in-Picture window */                                    \
@@ -12,11 +12,14 @@
 +  FIELD(TermuxMediaRecording, bool)                                           \
 +  /* Termux patch 0034: while true (and recording), the dump keeps its files  \
 +     and counters but leaves out the segments that arrive: a pause. */        \
-+  FIELD(TermuxMediaRecordingPaused, bool)
++  FIELD(TermuxMediaRecordingPaused, bool)                                     \
++  /* Termux patch 0034: the subfolder of media.termux.recording.dir that the  \
++     recording's parts go to (one folder per recording; empty: the dir). */   \
++  FIELD(TermuxMediaRecordingFolder, nsCString)
  
  #define NS_DOM_BROWSINGCONTEXT_IID \
    {0x5059a6aa, 0xf09, 0x415c, {0x89, 0xbd, 0x63, 0xfd, 0xe5, 0xab, 0x1a, 0x66}};
-@@ -684,6 +691,12 @@
+@@ -684,6 +694,15 @@
    bool IsActive() const;
    bool ForceOffline() const { return GetForceOffline(); }
  
@@ -25,11 +28,14 @@
 +  bool TermuxMediaRecordingPaused() const {
 +    return GetTermuxMediaRecordingPaused();
 +  }
++  void GetTermuxMediaRecordingFolder(nsACString& aFolder) const {
++    aFolder = GetTermuxMediaRecordingFolder();
++  }
 +
    nsILoadInfo::IPAddressSpace GetCurrentIPAddressSpace() const {
      return GetIPAddressSpace();
    }
-@@ -1572,6 +1585,16 @@
+@@ -1572,6 +1591,20 @@
    bool CanSet(FieldIndex<IDX_ForceOffline>, bool aNewValue,
                ContentParent* aSource);
  
@@ -42,11 +48,15 @@
 +              ContentParent* aSource) {
 +    return XRE_IsParentProcess() && !aSource;
 +  }
++  bool CanSet(FieldIndex<IDX_TermuxMediaRecordingFolder>, const nsCString&,
++              ContentParent* aSource) {
++    return XRE_IsParentProcess() && !aSource;
++  }
 +
    bool CanSet(FieldIndex<IDX_InnerSizeSpoofedForRFP>, const CSSIntSize&,
                ContentParent*) {
      return IsTop();
-@@ -1693,6 +1716,10 @@
+@@ -1693,6 +1726,10 @@
  
    void DidSet(FieldIndex<IDX_ForceOffline>, bool aOldValue);
  
@@ -59,7 +69,7 @@
        SetDisplayMode(DisplayMode::Picture_in_picture, IgnoreErrors());
 --- a/dom/chrome-webidl/BrowsingContext.webidl
 +++ b/dom/chrome-webidl/BrowsingContext.webidl
-@@ -159,6 +159,18 @@
+@@ -159,6 +159,24 @@
    [SetterThrows] attribute boolean forceOffline;
  
    /**
@@ -73,6 +83,12 @@
 +   * arrive are left out; the files and counters stay (a pause).
 +   */
 +  [SetterThrows] attribute boolean termuxMediaRecordingPaused;
++  /**
++   * Termux (patch 0034): the subfolder of media.termux.recording.dir that
++   * the recording's parts are written to; a single path component. Set it
++   * before termuxMediaRecording.
++   */
++  [SetterThrows] attribute UTF8String termuxMediaRecordingFolder;
 +
 +  /**
     * Sets whether this is an app tab. Non-same-origin link navigations from app
@@ -1385,7 +1401,7 @@
    StartUpdating();
  
    mTrackBuffersManager->AppendData(aData.forget(), mCurrentAttributes)
-@@ -644,11 +657,226 @@
+@@ -644,11 +657,236 @@
  
    CheckEndTime();
  
@@ -1463,6 +1479,16 @@
 +    return;
 +  }
 +  dir.Trim("/", false, true);
++  // One folder per recording, named by the parent (a single path component;
++  // anything else is ignored and the parts go to the directory itself).
++  nsAutoCString folder;
++  bc->Top()->GetTermuxMediaRecordingFolder(folder);
++  if (!folder.IsEmpty() && folder.Length() <= 200 &&
++      folder.FindChar('/') == kNotFound && !folder.EqualsLiteral(".") &&
++      !folder.EqualsLiteral("..")) {
++    dir.Append('/');
++    dir.Append(folder);
++  }
 +
 +  // <unix time>-<host>-<video|audio>-<id>, part and extension added by the
 +  // TrackBuffersManager.

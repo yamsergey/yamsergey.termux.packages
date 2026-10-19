@@ -14,7 +14,7 @@
 +]
 --- /dev/null
 +++ b/toolkit/components/termux/TermuxMediaRecording.sys.mjs
-@@ -0,0 +1,1189 @@
+@@ -0,0 +1,1233 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -61,6 +61,28 @@
 +  ["dom.ipc.processPriorityManager.enabled", false],
 +];
 +const PREF_APPLIED = "media.termux.recording.appliedPrefs";
++// One folder per recording, named "<start time> <tab title>", holding its
++// parts while it runs and the merged file and summary afterwards.
++const PREF_FOLDERS = "media.termux.recording.folderPerRecording";
++
++/**
++ * The folder name of a recording: its local start time and the tab title,
++ * reduced to letters, digits, spaces and ._- (a single path component).
++ */
++function folderName(startedAt, title, origin) {
++  const d = new Date(startedAt);
++  const pad = n => String(n).padStart(2, "0");
++  const stamp =
++    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_` +
++    `${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;
++  const label = String(title || origin || "recording")
++    .replace(/[^\p{L}\p{N} ._-]+/gu, " ")
++    .replace(/\s+/g, " ")
++    .trim()
++    .slice(0, 60)
++    .replace(/^[ .]+|[ .]+$/g, "");
++  return label ? `${stamp} ${label}` : stamp;
++}
 +
 +class Listeners {
 +  #fns = new Set();
@@ -102,6 +124,8 @@
 +    this.url = "";
 +    this.origin = "";
 +    this.summaryPath = null;
++    // The recording's own folder name (PREF_FOLDERS), "" without one.
++    this.folder = "";
 +    // Merge (status "saving" and after).
 +    this.progress = 0;
 +    this.output = null;
@@ -341,9 +365,18 @@
 +      createAncestors: true,
 +      ignoreExisting: true,
 +    });
-+    session.dir = dir;
-+    session.status = "recording";
 +    session.startedAt = Date.now();
++    this._refreshMeta(session);
++    session.folder = Services.prefs.getBoolPref(PREF_FOLDERS, true)
++      ? folderName(session.startedAt, session.title, session.origin)
++      : "";
++    session.dir = session.folder
++      ? `${dir.replace(/\/+$/, "")}/${session.folder}`
++      : dir;
++    if (session.folder) {
++      await IOUtils.makeDirectory(session.dir, { ignoreExisting: true });
++    }
++    session.status = "recording";
 +    session.stoppedAt = null;
 +    session.summaryPath = null;
 +    session.progress = 0;
@@ -352,7 +385,6 @@
 +    session.endedByPage = false;
 +    session.mergeError = null;
 +    session.frozenTracks = null;
-+    this._refreshMeta(session);
 +    this._applyBackgroundPrefs();
 +    this._setFlag(session, true);
 +    this._emit("state-changed", session);
@@ -470,6 +502,11 @@
 +      this._sessions.set(top.id, session);
 +    }
 +    const isNew = !session.tracks.has(key);
++    if (data.base && session.dir) {
++      // The parts are in the recording's folder (never a path from the
++      // content process: session.dir is built here from the pref).
++      data.dir = session.dir;
++    }
 +    session.tracks.set(key, { ...data, key, updatedAt: Date.now() });
 +    this._refreshMeta(session);
 +    if (data.state === "error" && session.status === "recording") {
@@ -583,6 +620,9 @@
 +      if (!session.browsingContext.isDiscarded) {
 +        if (!value) {
 +          session.browsingContext.termuxMediaRecordingPaused = false;
++        } else {
++          // Before the flag: SourceBuffer reads it when the dump turns on.
++          session.browsingContext.termuxMediaRecordingFolder = session.folder;
 +        }
 +        session.browsingContext.termuxMediaRecording = value;
 +      }
@@ -713,6 +753,10 @@
 +  },
 +
 +  _prefixOf(session) {
++    if (session.folder) {
++      // <folder>/<folder>.mp4 and .json: the name survives a copy elsewhere.
++      return session.folder;
++    }
 +    const source = session.frozenTracks || session.tracks;
 +    for (const t of source.values()) {
 +      if (t.base) {
