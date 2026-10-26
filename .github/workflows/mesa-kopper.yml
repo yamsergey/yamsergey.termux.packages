@@ -5,6 +5,11 @@ name: Mesa (zink via kopper)
 
 on:
   workflow_dispatch:
+    inputs:
+      unstripped:
+        description: 'Keep ELF symbols (TERMUX_PKG_NO_STRIP), to symbolicate stacks from the stripped build'
+        type: boolean
+        default: false
   push:
     branches:
     - mesa-kopper
@@ -34,6 +39,9 @@ jobs:
       run: ./scripts/run-docker.sh true
     - name: Free additional disk space
       run: ./scripts/free-space.sh
+    - name: Keep symbols
+      if: inputs.unstripped
+      run: sed -i '/^TERMUX_PKG_REVISION=/a TERMUX_PKG_NO_STRIP=true' packages/mesa/build.sh
     - name: Build mesa
       run: ./scripts/run-docker.sh -d ./build-package.sh -I -C -a aarch64 mesa
     - name: Checksums
@@ -46,5 +54,5 @@ jobs:
       if: always()
       uses: actions/upload-artifact@v7
       with:
-        name: mesa-kopper-aarch64-${{ github.sha }}
+        name: mesa-kopper-aarch64${{ inputs.unstripped && '-unstripped' || '' }}-${{ github.sha }}
         path: output/
