@@ -49,6 +49,8 @@ jobs:
       run: |
         mkdir -p output
         test -d termux-packages/output && mv termux-packages/output/* ./output/ || true
+        # Dependencies built on the way are not ours to ship, and names like openssl_1:… break the upload.
+        find output -type f ! -name 'mesa*.deb' -delete
         find output -type f -name "*.deb" -exec sha256sum "{}" \; | sort -k2 | tee output/SHA256SUMS
     - name: Store *.deb files
       if: always()
