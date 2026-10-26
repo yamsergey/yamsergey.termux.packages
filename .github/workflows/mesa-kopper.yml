@@ -41,7 +41,10 @@ jobs:
       run: ./scripts/free-space.sh
     - name: Keep symbols
       if: inputs.unstripped
-      run: sed -i '/^TERMUX_PKG_REVISION=/a TERMUX_PKG_NO_STRIP=true' packages/mesa/build.sh
+      # meson install --strip strips on its own, whatever TERMUX_PKG_NO_STRIP says.
+      run: |
+        sed -i '/^TERMUX_PKG_REVISION=/a TERMUX_PKG_NO_STRIP=true' packages/mesa/build.sh
+        sed -i 's/local _meson_stripflag="--strip"/local _meson_stripflag=/' scripts/build/configure/termux_step_configure_meson.sh
     - name: Build mesa
       run: ./scripts/run-docker.sh -d ./build-package.sh -I -C -a aarch64 mesa
     - name: Checksums
