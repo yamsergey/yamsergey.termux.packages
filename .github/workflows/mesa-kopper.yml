@@ -38,7 +38,12 @@ jobs:
     - name: Load Docker image
       run: ./scripts/run-docker.sh true
     - name: Free additional disk space
-      run: ./scripts/free-space.sh
+      # Keep /opt/runner-cache: a run on 2026-10-27 built mesa and then could not start the
+      # runner's own node for upload-artifact (externals/node24 missing). Unverified that this
+      # is the cause; the same image and runner version had worked the day before.
+      run: |
+        sed -i 's| /opt/runner-cache||' scripts/free-space.sh
+        ./scripts/free-space.sh
     - name: Keep symbols
       if: inputs.unstripped
       # meson install --strip strips on its own, whatever TERMUX_PKG_NO_STRIP says.
