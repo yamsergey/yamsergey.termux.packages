@@ -1,0 +1,53 @@
+Backport of upstream commit 52efd18c005d17031fe5dd1a03153f5f383546c5 (in Mesa 26.2.5):
+"zink: Catch all prior updates to source valid_buffer_range."
+
+zink_context_replace_buffer_storage copied the source's util_range by value,
+write_mutex included. If the threaded context was inside util_range_add on the
+source at that moment, the copy kept a locked mutex with no holder, and the next
+buffer_map of the destination waited forever (Firefox hang, yamsergey.linux.android B63).
+https://gitlab.freedesktop.org/mesa/mesa/-/commit/52efd18c005d17031fe5dd1a03153f5f383546c5
+
+diff --git a/src/gallium/auxiliary/util/u_range.h b/src/gallium/auxiliary/util/u_range.h
+index 7270ca738d4d4d687438b481bae5df01e01d292a..bfafb1fa7b06c3ce9f42b4f647d11b73f2d019f4 100644
+--- a/src/gallium/auxiliary/util/u_range.h
++++ b/src/gallium/auxiliary/util/u_range.h
+@@ -76,6 +76,21 @@ util_range_add(struct pipe_resource *resource, struct util_range *range,
+    }
+ }
+ 
++static inline void
++u_range_copy(struct pipe_resource *resource, struct util_range *dst, struct util_range *src)
++{
++   if (resource->flags & PIPE_RESOURCE_FLAG_SINGLE_THREAD_USE ||
++       p_atomic_read(&resource->screen->num_contexts) == 1) {
++      dst->start = src->start;
++      dst->end = src->end;
++   } else {
++      simple_mtx_lock(&src->write_mutex);
++      dst->start = src->start;
++      dst->end = src->end;
++      simple_mtx_unlock(&src->write_mutex);
++   }
++}
++
+ static inline bool
+ util_ranges_intersect(const struct util_range *range,
+                       unsigned start, unsigned end)
+diff --git a/src/gallium/drivers/zink/zink_context.c b/src/gallium/drivers/zink/zink_context.c
+index 6ac90a175394a4bdf1be3c83c209ee081b78b6a6..4c32fd5dd9968713a15a4bd546bebacd5f7427d2 100644
+--- a/src/gallium/drivers/zink/zink_context.c
++++ b/src/gallium/drivers/zink/zink_context.c
+@@ -5793,8 +5793,12 @@ zink_context_replace_buffer_storage(struct pipe_context *pctx, struct pipe_resou
+    zink_batch_reference_resource(ctx, d);
+    /* don't be too creative */
+    zink_resource_object_reference(screen, &d->obj, s->obj);
+-   d->valid_buffer_range = s->valid_buffer_range;
++
++   /* don't miss range expansion from the tc thread on the source buffer */
++   util_range_set_empty(&d->valid_buffer_range);
+    s->real_buffer_range = &d->valid_buffer_range;
++   u_range_copy(src, &d->valid_buffer_range, &s->valid_buffer_range);
++
+    zink_resource_copies_reset(d);
+    /* force counter buffer reset */
+    d->so_valid = false;
