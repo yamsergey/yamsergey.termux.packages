@@ -1,6 +1,6 @@
 name: Mesa (zink via kopper)
 
-# Builds only packages/mesa for aarch64 with 0019-egl-zink-kopper-without-drm.patch
+# Builds only packages/mesa for aarch64 with 0020-egl-zink-kopper-without-drm.patch
 # (yamsergey.linux.android E6). Same steps as packages.yml (zram, package-builder Docker image, free-space).
 
 on:
